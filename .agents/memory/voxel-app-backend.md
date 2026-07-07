@@ -30,6 +30,16 @@ Squeeze with `.squeeze()` before `.detach().cpu().numpy()` since shape can be `(
 
 Relative `bash voxel-backend/start.sh` fails — the managed workflow's CWD is not the workspace root.
 
+## Three.js InstancedMesh color fix
+
+**NEVER use MeshLambertMaterial({ vertexColors: true }) with InstancedMesh.**
+BoxGeometry has no `color` vertex attribute; with `vertexColors:true` the shader reads (0,0,0)
+and multiplies the instance color by zero → black voxels.
+
+**Correct approach:** `new THREE.MeshBasicMaterial()` (vertexColors defaults to false).
+Per-instance colors set via `mesh.setColorAt(i, color)` + `mesh.instanceColor.needsUpdate = true`.
+Three.js enables `USE_INSTANCING_COLOR` shader path independently of vertexColors — no lighting needed.
+
 ## Frontend loop architecture
 
 - `loopActiveRef` = single-flight guard (prevents concurrent loops)
@@ -37,8 +47,18 @@ Relative `bash voxel-backend/start.sh` fails — the managed workflow's CWD is n
 - Stop→start race handled in finally: if `isRunningRef.current` is true when loop exits, calls `loop()` again
 - `pollUntilDone` tracks `lastStageCount` to append only new stage events each poll cycle (2s interval)
 - Voxels only rendered when `status === 'done' && result !== null`
+- `lastResultRef` stores last ScanResult so color-mode toggle can recolor without a new scan
+- `useEffect([colorMode])` calls `renderVoxels(lastResultRef.current)` on toggle
+
+## Auto-fit camera
+
+`autoFitCamera(voxels, vSize)` computes bounding box of all rendered voxel positions,
+then derives required camera distance from BOTH vertical and horizontal FOV (uses the more
+constraining axis — `Math.max(distV, distH)`) multiplied by 1.5 margin.
+Must read `canvas.clientWidth/Height` for aspect ratio (not `camera.aspect`) to handle
+cases where camera hasn't been updated yet after resize.
 
 ## Model performance on this environment
 
 Model: `depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf` (cached after first download ~30s)
-RAM: 8.4 GB, CPU only (no CUDA). Inference: ~10s on a 100×100 image, scales up with resolution.
+RAM: 8.4 GB, CPU only (no CUDA). Inference: ~10–12s on a 640×480 frame, scales with resolution.

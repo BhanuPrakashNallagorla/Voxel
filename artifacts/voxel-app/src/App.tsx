@@ -94,6 +94,9 @@ function Home() {
   const instancedMeshRef = useRef<THREE.InstancedMesh | null>(null);
   const frameIdRef = useRef<number>(0);
 
+  // Last scan result — lets color-mode toggle recolor without a new scan
+  const lastResultRef = useRef<ScanResult | null>(null);
+
   // Control state + refs (refs used inside async loops to avoid stale closures)
   const [voxelSize, setVoxelSize] = useState(0.25);
   const voxelSizeRef = useRef(0.25);
@@ -124,6 +127,18 @@ function Home() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
 
+  // Color mode toggle
+  const [colorMode, setColorMode] = useState<'depth' | 'solid'>('depth');
+  const colorModeRef = useRef<'depth' | 'solid'>('depth');
+  const handleColorModeToggle = () => {
+    const next = colorModeRef.current === 'depth' ? 'solid' : 'depth';
+    colorModeRef.current = next;
+    setColorMode(next);
+  };
+
+  // Depth range for legend (updated after each successful scan)
+  const [depthRange, setDepthRange] = useState<{ min: number; max: number } | null>(null);
+
   // ── Log helper ──────────────────────────────────────────────────────────────
   const appendLog = useCallback((stage: string, message: string) => {
     const t = new Date().toISOString().substring(11, 23);
@@ -144,6 +159,14 @@ function Home() {
     }, 1000);
     return () => clearInterval(id);
   }, [isRunning]);
+
+  // ── Recolor existing voxels when color mode changes ─────────────────────────
+  // renderVoxels is stable (useCallback), so this only fires on actual mode change.
+  useEffect(() => {
+    if (lastResultRef.current) renderVoxels(lastResultRef.current);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [colorMode]); // intentionally omitting renderVoxels — it's stable but including it
+                   // would cause an extra render on mount; the ref covers the dependency.
 
   // ── Three.js init ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -178,15 +201,26 @@ function Home() {
     controls.dampingFactor = 0.05;
     controlsRef.current = controls;
 
+    // Lighting (kept for scene; MeshBasicMaterial ignores it but it's harmless)
     scene.add(new THREE.AmbientLight(0xffffff, 0.6));
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
     dirLight.position.set(5, 10, 5);
     scene.add(dirLight);
-    scene.add(new THREE.GridHelper(20, 20, 0x165a4c, 0x0f2a24));
-    scene.add(new THREE.AxesHelper(1));
 
+    // Fog — matches bg color so distant voxels fade naturally
+    scene.fog = new THREE.Fog(0x050508, 10, 28);
+
+    // Dimmed grid/axes so voxels stand out
+    scene.add(new THREE.GridHelper(20, 20, 0x0c2a1e, 0x071510));
+    scene.add(new THREE.AxesHelper(0.8));
+
+    // MeshBasicMaterial: ignores lighting entirely, so per-instance colors
+    // set via setColorAt() always show correctly without needing lights.
+    // (MeshLambertMaterial with vertexColors:true was black because BoxGeometry
+    //  has no 'color' vertex attribute — the shader read (0,0,0) and
+    //  multiplied the instance color against it.)
     const geometry = new THREE.BoxGeometry(1, 1, 1);
-    const material = new THREE.MeshLambertMaterial({ vertexColors: true });
+    const material = new THREE.MeshBasicMaterial();
     const instancedMesh = new THREE.InstancedMesh(geometry, material, 50000);
     instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     instancedMesh.count = 0;
@@ -254,6 +288,42 @@ function Home() {
     }
   }, [logs]);
 
+  // ── Auto-fit camera to bounding box of rendered voxels ───────────────────────
+  const autoFitCamera = useCallback((voxels: Voxel[], vSize: number) => {
+    const camera = cameraRef.current;
+    const controls = controlsRef.current;
+    const canvas = canvasRef.current;
+    if (!camera || !controls || voxels.length === 0) return;
+    const box = new THREE.Box3();
+    const pt = new THREE.Vector3();
+    for (const v of voxels) {
+      pt.set(v.x, -v.y, v.z);
+      box.expandByPoint(pt);
+    }
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    // Add a voxel-size margin so the outermost cubes aren't clipped
+    const radius = Math.max(size.x, size.y, size.z) * 0.5 + vSize * 2;
+    // Use whichever FOV axis is more constraining (vertical or horizontal).
+    // Vertical FOV is camera.fov. Horizontal FOV depends on the canvas aspect ratio.
+    const aspect = canvas ? canvas.clientWidth / canvas.clientHeight : camera.aspect;
+    const vFovRad = camera.fov * (Math.PI / 180);
+    const hFovRad = 2 * Math.atan(Math.tan(vFovRad / 2) * aspect);
+    const distV = radius / Math.tan(vFovRad / 2);
+    const distH = radius / Math.tan(hFovRad / 2);
+    const distance = Math.max(distV, distH) * 1.5;
+    camera.position.set(
+      center.x + distance * 0.45,
+      center.y + distance * 0.55,
+      center.z + distance,
+    );
+    camera.lookAt(center);
+    controls.target.copy(center);
+    controls.update();
+  }, []);
+
   // ── Render voxels into Three.js InstancedMesh ────────────────────────────────
   const renderVoxels = useCallback((result: ScanResult) => {
     const mesh = instancedMeshRef.current;
@@ -267,19 +337,35 @@ function Home() {
     const maxD = maxDepthRef.current;
     const vSize = voxelSizeRef.current;
     const scale = new THREE.Vector3(vSize, vSize, vSize);
+    const isDepth = colorModeRef.current === 'depth';
     for (let i = 0; i < count; i++) {
       const v = voxels[i];
       matrix.makeTranslation(v.x, -v.y, v.z);
       matrix.scale(scale);
       mesh.setMatrixAt(i, matrix);
-      color.setHSL((v.depth / maxD) * 0.67, 1.0, 0.55);
+      if (isDepth) {
+        // Hue 0 (red) = near, hue 0.67 (blue) = far
+        color.setHSL((v.depth / maxD) * 0.67, 1.0, 0.55);
+      } else {
+        color.setHex(0x00ff80); // solid primary green
+      }
       mesh.setColorAt(i, color);
     }
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+
+    // Auto-fit camera so the cluster is framed on every new scan
+    autoFitCamera(voxels.slice(0, count), vSize);
+
+    // Persist result so color-mode toggle can recolor without a new scan
+    lastResultRef.current = result;
+
+    // Update depth range for the legend
     const ds = result.depth_stats;
+    setDepthRange({ min: ds.min_m, max: ds.max_m });
+
     appendLog("RENDER", `${voxels.length} voxels  depth=[${ds.min_m.toFixed(2)}–${ds.max_m.toFixed(2)} m]  pts=${result.total_points}`);
-  }, [appendLog]);
+  }, [appendLog, autoFitCamera]);
 
   // ── Capture one frame from camera ────────────────────────────────────────────
   const captureFrame = (): string | null => {
@@ -562,6 +648,37 @@ function Home() {
             </div>
           </div>
         </div>
+
+        {/* Color mode toggle — bottom-right */}
+        <button
+          onClick={handleColorModeToggle}
+          className="absolute bottom-5 right-5 z-10 font-mono text-[10px] uppercase tracking-widest bg-black/60 border border-primary/20 text-primary/70 px-3 py-1.5 rounded hover:bg-primary/10 hover:text-primary transition-colors backdrop-blur-sm"
+        >
+          {colorMode === 'depth' ? '⬛ DEPTH GRADIENT' : '🟩 SOLID FILL'}
+        </button>
+
+        {/* Depth legend — bottom-centre, shown after first scan */}
+        {depthRange && (
+          <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+            <div className="bg-black/60 backdrop-blur-sm border border-primary/15 rounded-lg px-4 py-2.5 text-center">
+              <div className="text-[9px] text-primary/50 uppercase tracking-widest mb-1.5 font-bold font-mono">
+                Depth Scale
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-[10px] text-red-400 tabular-nums">{depthRange.min.toFixed(1)}m</span>
+                <div
+                  className="w-28 h-2 rounded-full"
+                  style={{ background: 'linear-gradient(to right, #ff2200, #ffaa00, #00ff80, #0099ff, #3300ff)' }}
+                />
+                <span className="font-mono text-[10px] text-blue-400 tabular-nums">{depthRange.max.toFixed(1)}m</span>
+              </div>
+              <div className="flex justify-between mt-0.5">
+                <span className="font-mono text-[8px] text-red-400/50">NEAR</span>
+                <span className="font-mono text-[8px] text-blue-400/50">FAR</span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Dot-grid overlay */}
         <div className="absolute inset-0 pointer-events-none bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMCwyNTUsMTI4LDAuMDUpIi8+PC9zdmc+')] opacity-50 mix-blend-screen" />
