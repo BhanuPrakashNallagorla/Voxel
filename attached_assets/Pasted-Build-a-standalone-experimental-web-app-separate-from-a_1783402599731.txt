@@ -1,0 +1,19 @@
+Build a standalone experimental web app (separate from any other project) that converts a live phone camera feed into a Tesla-style 3D occupancy voxel grid, visible in the browser frontend. Accuracy is the priority, not speed — use the largest/most accurate models available, no optimization for real-time performance at this stage.
+
+Pipeline:
+1. Capture live video from the phone camera using getUserMedia in the browser.
+2. Send frames to a Flask (or FastAPI) backend running the largest available monocular depth model (Depth Anything V2 Large, or Depth Pro if available) — metric depth output required, not just relative depth.
+3. Using the pinhole camera model, back-project every pixel's depth value into a 3D point (X, Y, Z in meters, relative to camera), using standard camera intrinsics (fx, fy, cx, cy) — estimate reasonable default intrinsics if calibration isn't available, but make them configurable.
+4. Bucket the resulting 3D points into a coarse 3D voxel grid (make grid resolution configurable, e.g., start with 0.25m voxel size, covering up to ~5m depth in front of the camera).
+5. Mark each voxel as "occupied" if it contains a minimum threshold number of points (configurable), otherwise "free." Discard/ignore empty space beyond max range.
+
+Frontend visualization:
+6. Render the voxel grid in 3D using Three.js, rendered as small colored cubes (occupied voxels only), viewable and rotatable/zoomable by the user (orbit controls).
+7. Color-code voxels by distance from camera (e.g., near = red, far = green/blue) similar to Tesla's occupancy network dashboard visualization style.
+8. Update this 3D view live as new frames are processed (it's fine if this updates slower than real-time — correctness over speed).
+9. Add a simple stage-by-stage status log (frame capture → depth inference → point cloud → voxelization → render) so I can see where time is being spent and debug failures at each stage.
+10. Add on-screen controls for: voxel size, max depth range, minimum points-per-voxel threshold — so I can tune these live without redeploying.
+
+Keep this project fully separate from any existing codebase — new Repl, own folder structure. Load the depth model once at startup (not per-frame) to avoid repeated load overhead. Add clear error logging at every stage instead of failing silently.
+
+Let me know once it's testable, and flag any memory/compute issues from loading the largest model variant in this sandbox.

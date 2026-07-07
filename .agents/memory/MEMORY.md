@@ -1,0 +1,1 @@
+- [Voxel app Python backend](voxel-app-backend.md) — depth pipeline uses predicted_depth tensor, not depth PIL image; managed artifact workflow path must be absolute.
