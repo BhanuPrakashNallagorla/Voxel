@@ -314,7 +314,9 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
         Z = depth_array
         range_mask = valid_mask & (Z <= req.max_depth)
         Zf = Z[range_mask]
-        Xf = (grid_u[range_mask] - req.cx) * Zf / req.fx
+        # Negate X: Three.js right-handed scene expects +X to match pixel columns
+        # after the camera's natural mirror — flip here so 3D matches video preview.
+        Xf = -((grid_u[range_mask] - req.cx) * Zf / req.fx)
         Yf = (grid_v[range_mask] - req.cy) * Zf / req.fy
         total_points = int(Xf.size)
     except Exception as exc:

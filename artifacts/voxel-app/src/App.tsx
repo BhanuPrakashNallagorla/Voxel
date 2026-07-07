@@ -500,7 +500,7 @@ function Home() {
         const d = depth_map[r * W + c];
         const idx = r * W + c;
         if (d > 0) {
-          vX[idx] = (c - cx) * d / fx;
+          vX[idx] = -((c - cx) * d / fx); // negate X to match video preview orientation
           vY[idx] = -((r - cy) * d / fy);
           vZ[idx] = d;
           valid[idx] = 1;
@@ -608,7 +608,7 @@ function Home() {
         const d = depth_map[r * W + c];
         if (d <= 0) continue;
         const base = n * 3;
-        positions[base]     = (c - cx) * d / fx;
+        positions[base]     = -((c - cx) * d / fx); // negate X to match video preview orientation
         positions[base + 1] = -((r - cy) * d / fy); // Y-flip matches voxel coord system
         positions[base + 2] = d;
         // Red→blue depth gradient (hue 0 = near, 0.67 = far) — same as voxel depth mode
