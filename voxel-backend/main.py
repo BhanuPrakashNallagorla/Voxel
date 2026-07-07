@@ -119,10 +119,25 @@ CANDIDATE_MODELS = [
     "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
 ]
 
+# SegFormer (Cityscapes-finetuned) — semantic segmentation for walkability overlay
+seg_processor = None
+seg_model = None
+seg_model_name: Optional[str] = None
+seg_load_error: Optional[str] = None
+
+SEG_CANDIDATE_MODELS = [
+    "nvidia/segformer-b0-finetuned-cityscapes-512-1024",
+    "nvidia/segformer-b2-finetuned-cityscapes-1024-1024",
+]
+
+# Cityscapes class IDs that are walkable (road=0, sidewalk=1, terrain=9)
+WALKABLE_CLASSES: frozenset = frozenset([0, 1, 9])
+
 
 @app.on_event("startup")
 async def startup_event():
     global depth_pipe, model_name, model_load_error
+    global seg_processor, seg_model, seg_model_name, seg_load_error
     from transformers import pipeline as hf_pipeline
 
     device_id = 0 if torch.cuda.is_available() else -1
@@ -162,6 +177,30 @@ async def startup_event():
             "Check RAM/GPU constraints and HuggingFace connectivity."
         )
         logger.error(model_load_error)
+
+    # ── Load SegFormer for semantic segmentation (walkability overlay) ─────────
+    for seg_candidate in SEG_CANDIDATE_MODELS:
+        logger.info(f"Attempting to load segmentation model: {seg_candidate}")
+        try:
+            from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+            _proc = SegformerImageProcessor.from_pretrained(seg_candidate)
+            _mdl  = SegformerForSemanticSegmentation.from_pretrained(seg_candidate)
+            if device_id >= 0:
+                _mdl = _mdl.cuda()
+            _mdl.eval()
+            seg_processor = _proc
+            seg_model     = _mdl
+            seg_model_name = seg_candidate
+            logger.info(f"✅ Segmentation model loaded: {seg_candidate}")
+            break
+        except Exception as exc:
+            logger.error(f"❌ Failed to load seg model {seg_candidate}: {exc}\n{traceback.format_exc()}")
+            seg_processor = None
+            seg_model     = None
+
+    if seg_model is None:
+        seg_load_error = "All SegFormer candidates failed. Walkability overlay will be unavailable."
+        logger.warning(seg_load_error)
 
 
 # ─── Request models ───────────────────────────────────────────────────────────
@@ -238,6 +277,32 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
             msg=f"{depth_s*1000:.0f} ms  |  range [{d_min:.2f}–{d_max:.2f} m]  mean {d_mean:.2f} m")
     logger.info(f"[{job_id}] DEPTH {depth_s*1000:.0f} ms  [{d_min:.2f}–{d_max:.2f} m]")
 
+    # ── Stage 2.5: Semantic segmentation (walkability overlay) ───────────────
+    seg_full = np.zeros((H, W), dtype=np.uint8)
+    if seg_processor is not None and seg_model is not None:
+        _record(job, "SEGMENT", "start")
+        t_seg = time.perf_counter()
+        try:
+            inputs = seg_processor(images=pil_image, return_tensors="pt")
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+            with torch.no_grad():
+                outputs = seg_model(**inputs)
+            # Upsample logits from (1, C, H/4, W/4) → (1, C, H, W), then argmax
+            logits = outputs.logits
+            upsampled = torch.nn.functional.interpolate(
+                logits, size=(H, W), mode="bilinear", align_corners=False
+            )
+            seg_full = upsampled.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+            seg_s = time.perf_counter() - t_seg
+            num_classes = int(logits.shape[1])
+            _record(job, "SEGMENT", "done",
+                    msg=f"{seg_s*1000:.0f} ms  |  {num_classes} classes  {W}×{H}")
+            logger.info(f"[{job_id}] SEGMENT {seg_s*1000:.0f} ms")
+        except Exception as exc:
+            _record(job, "SEGMENT", "error", error=f"{exc}\n{traceback.format_exc()}")
+            seg_full = np.zeros((H, W), dtype=np.uint8)
+
     # ── Stage 3: Back-project to 3-D point cloud ──────────────────────────────
     _record(job, "BACKPROJ", "start")
     t2 = time.perf_counter()
@@ -269,6 +334,7 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
             "depth_stats": {"min_m": d_min, "max_m": d_max, "mean_m": d_mean,
                             "valid_pixels": total_valid, "total_pixels": H * W},
             "depth_map": [],
+            "seg_map": [],
             "grid_h": 0,
             "grid_w": 0,
             "grid_fx": req.fx,
@@ -344,6 +410,18 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
         # Round to 2 decimal places (1 cm precision) to reduce JSON size
         depth_map_flat = depth_small.ravel().round(2).tolist()
 
+        # Downsample segmentation map to match the depth grid resolution
+        if seg_full.size > 0 and scale < 1.0:
+            seg_small = np.array(
+                Image.fromarray(seg_full).resize((mesh_w, mesh_h), Image.NEAREST),
+                dtype=np.uint8,
+            )
+        elif seg_full.size > 0:
+            seg_small = seg_full
+        else:
+            seg_small = np.zeros((mesh_h, mesh_w), dtype=np.uint8)
+        seg_map_flat = seg_small.ravel().tolist()
+
         job["result"] = {
             "voxels": voxels_out,
             "total_points": total_points,
@@ -357,6 +435,8 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
             },
             # Mesh reconstruction data — flat 1D array, reshape to (grid_h, grid_w)
             "depth_map": depth_map_flat,
+            # Segmentation map — same grid resolution, flat 1D uint8 class IDs
+            "seg_map": seg_map_flat,
             "grid_h": mesh_h,
             "grid_w": mesh_w,
             # Scaled camera intrinsics matching the subsampled grid

@@ -50,6 +50,8 @@ interface ScanResult {
   depth_stats: { min_m: number; max_m: number; mean_m: number; valid_pixels: number; total_pixels: number };
   // Mesh reconstruction — flat 1D depth map, reshape to (grid_h × grid_w)
   depth_map?: number[];
+  // Semantic segmentation — flat 1D uint8 Cityscapes class IDs, same grid as depth_map
+  seg_map?: number[];
   grid_h?: number;
   grid_w?: number;
   grid_fx?: number;
@@ -228,7 +230,10 @@ function Home() {
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
+    controls.dampingFactor = 0.08;
+    controls.rotateSpeed   = 0.5;
+    controls.zoomSpeed     = 0.7;
+    controls.panSpeed      = 0.6;
     controlsRef.current = controls;
 
     // Lighting — AmbientLight + DirectionalLight for MeshStandardMaterial shading
@@ -240,12 +245,18 @@ function Home() {
     fillLight.position.set(-5, -2, -5);
     scene.add(fillLight);
 
-    // Fog — matches bg color so distant geometry fades naturally
-    scene.fog = new THREE.Fog(0x050508, 10, 28);
+    // Fog — subtle, matches bg color, gives depth perception
+    scene.fog = new THREE.Fog(0x050508, 8, 25);
 
-    // Grid / axes
-    scene.add(new THREE.GridHelper(20, 20, 0x0c2a1e, 0x071510));
-    scene.add(new THREE.AxesHelper(0.8));
+    // Grid / axes — dimmed so the mesh stands out
+    const gridHelper = new THREE.GridHelper(20, 20, 0x061208, 0x040c06);
+    (gridHelper.material as THREE.Material).opacity = 0.4;
+    (gridHelper.material as THREE.Material).transparent = true;
+    scene.add(gridHelper);
+    const axesHelper = new THREE.AxesHelper(0.5);
+    (axesHelper.material as THREE.Material).opacity = 0.25;
+    (axesHelper.material as THREE.Material).transparent = true;
+    scene.add(axesHelper);
 
     // ── Voxel InstancedMesh ──────────────────────────────────────────────────
     const geometry = new THREE.BoxGeometry(1, 1, 1);
@@ -263,10 +274,12 @@ function Home() {
     const meshSurface = new THREE.Mesh(
       new THREE.BufferGeometry(),
       new THREE.MeshStandardMaterial({
-        color: 0xaaaaaa,
+        vertexColors: true,   // driven by per-vertex walkability colors from seg_map
+        color: 0xffffff,      // white tint so vertex colors appear at full saturation
         side: THREE.DoubleSide,
-        roughness: 0.75,
-        metalness: 0.05,
+        roughness: 0.72,
+        metalness: 0.04,
+        flatShading: false,   // smooth interpolated normals
       })
     );
     meshSurface.frustumCulled = false;
@@ -382,6 +395,41 @@ function Home() {
     controls.update();
   }, []);
 
+  // ── Auto-fit camera to mesh bounding box (mesh mode) ────────────────────────
+  const autoFitMesh = useCallback((geo: THREE.BufferGeometry) => {
+    const camera   = cameraRef.current;
+    const controls = controlsRef.current;
+    if (!camera || !controls) return;
+
+    geo.computeBoundingBox();
+    const box = geo.boundingBox;
+    if (!box) return;
+
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const diagRadius = size.length() * 0.5;
+
+    // Orbit target = mesh bounding-box centre — fixes erratic pivot
+    controls.target.copy(center);
+
+    // Position camera slightly above and behind the mesh, looking at centre
+    const vFovRad  = camera.fov * (Math.PI / 180);
+    const fitDist  = (diagRadius / Math.tan(vFovRad / 2)) * 1.35;
+    camera.position.set(
+      center.x + fitDist * 0.3,
+      center.y + fitDist * 0.35,
+      center.z - fitDist * 0.9,   // negative Z = "behind" the scene
+    );
+    camera.lookAt(center);
+
+    // Zoom limits derived from scene scale
+    controls.minDistance = Math.max(0.4, diagRadius * 0.15);
+    controls.maxDistance = diagRadius * 5;
+    controls.update();
+  }, []);
+
   // ── Render voxels into Three.js InstancedMesh ────────────────────────────────
   const renderVoxels = useCallback((result: ScanResult) => {
     const mesh = instancedMeshRef.current;
@@ -424,12 +472,12 @@ function Home() {
     appendLog("RENDER", `${voxels.length} voxels  depth=[${ds.min_m.toFixed(2)}–${ds.max_m.toFixed(2)} m]  pts=${result.total_points}`);
   }, [appendLog, autoFitCamera]);
 
-  // ── Build smooth mesh from depth map via grid triangulation ─────────────────
+  // ── Build smooth mesh from depth map + walkability vertex colors ─────────────
   const renderMesh = useCallback((result: ScanResult) => {
     const surface = meshSurfaceRef.current;
     if (!surface) return;
 
-    const { depth_map, grid_h, grid_w, grid_fx, grid_fy, grid_cx, grid_cy } = result;
+    const { depth_map, seg_map, grid_h, grid_w, grid_fx, grid_fy, grid_cx, grid_cy } = result;
     if (!depth_map || !grid_h || !grid_w || depth_map.length === 0) return;
 
     const H = grid_h;
@@ -439,6 +487,7 @@ function Home() {
     const cx = grid_cx ?? W / 2;
     const cy = grid_cy ?? H / 2;
     const threshold = depthJumpThresholdRef.current;
+    const hasSeg = !!(seg_map && seg_map.length === H * W);
 
     // Back-project every pixel to 3-D (same pinhole formula as voxels, Y-flipped)
     const vX = new Float32Array(H * W);
@@ -452,17 +501,39 @@ function Home() {
         const idx = r * W + c;
         if (d > 0) {
           vX[idx] = (c - cx) * d / fx;
-          vY[idx] = -((r - cy) * d / fy); // flip Y to match voxel coordinate system
+          vY[idx] = -((r - cy) * d / fy);
           vZ[idx] = d;
           valid[idx] = 1;
         }
       }
     }
 
+    // Pre-compute per-pixel RGB from seg class
+    // Cityscapes walkable: road=0, sidewalk=1, terrain=9 → green
+    // Everything else → red.  No seg data → neutral grey.
+    const WALKABLE = new Set([0, 1, 9]);
+    const pixRGB = new Float32Array(H * W * 3);
+    if (hasSeg) {
+      for (let i = 0; i < H * W; i++) {
+        const cls = seg_map![i];
+        if (WALKABLE.has(cls)) {
+          pixRGB[i * 3]     = 0.13;   // green
+          pixRGB[i * 3 + 1] = 0.72;
+          pixRGB[i * 3 + 2] = 0.27;
+        } else {
+          pixRGB[i * 3]     = 0.82;   // red
+          pixRGB[i * 3 + 1] = 0.17;
+          pixRGB[i * 3 + 2] = 0.17;
+        }
+      }
+    } else {
+      pixRGB.fill(0.65); // grey fallback
+    }
+
     // Triangulate every 2×2 block of adjacent pixels into 2 triangles.
-    // Skip quads where any vertex is invalid or the depth jump exceeds threshold
-    // (prevents smearing across foreground/background boundaries).
+    // Skip quads where any vertex is invalid or depth jump > threshold.
     const positions: number[] = [];
+    const colors: number[]    = [];
 
     for (let r = 0; r < H - 1; r++) {
       for (let c = 0; c < W - 1; c++) {
@@ -473,41 +544,41 @@ function Home() {
 
         if (!valid[i00] || !valid[i01] || !valid[i10] || !valid[i11]) continue;
 
-        const d00 = vZ[i00];
-        const d01 = vZ[i01];
-        const d10 = vZ[i10];
-        const d11 = vZ[i11];
-
-        const dMax = Math.max(d00, d01, d10, d11);
-        const dMin = Math.min(d00, d01, d10, d11);
+        const dMax = Math.max(vZ[i00], vZ[i01], vZ[i10], vZ[i11]);
+        const dMin = Math.min(vZ[i00], vZ[i01], vZ[i10], vZ[i11]);
         if (dMax - dMin > threshold) continue;
 
-        // Triangle 1: top-left → bottom-left → top-right
-        positions.push(
-          vX[i00], vY[i00], vZ[i00],
-          vX[i10], vY[i10], vZ[i10],
-          vX[i01], vY[i01], vZ[i01],
+        // Triangle 1: i00 → i10 → i01
+        positions.push(vX[i00], vY[i00], vZ[i00], vX[i10], vY[i10], vZ[i10], vX[i01], vY[i01], vZ[i01]);
+        colors.push(
+          pixRGB[i00*3], pixRGB[i00*3+1], pixRGB[i00*3+2],
+          pixRGB[i10*3], pixRGB[i10*3+1], pixRGB[i10*3+2],
+          pixRGB[i01*3], pixRGB[i01*3+1], pixRGB[i01*3+2],
         );
-        // Triangle 2: top-right → bottom-left → bottom-right
-        positions.push(
-          vX[i01], vY[i01], vZ[i01],
-          vX[i10], vY[i10], vZ[i10],
-          vX[i11], vY[i11], vZ[i11],
+        // Triangle 2: i01 → i10 → i11
+        positions.push(vX[i01], vY[i01], vZ[i01], vX[i10], vY[i10], vZ[i10], vX[i11], vY[i11], vZ[i11]);
+        colors.push(
+          pixRGB[i01*3], pixRGB[i01*3+1], pixRGB[i01*3+2],
+          pixRGB[i10*3], pixRGB[i10*3+1], pixRGB[i10*3+2],
+          pixRGB[i11*3], pixRGB[i11*3+1], pixRGB[i11*3+2],
         );
       }
     }
 
-    // Dispose old geometry to free GPU memory
     surface.geometry.dispose();
-
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(colors), 3));
     geo.computeVertexNormals(); // smooth shading from triangle normals
+
     surface.geometry = geo;
 
+    // Auto-fit camera pivot to this mesh so orbit doesn't swing erratically
+    autoFitMesh(geo);
+
     const triCount = positions.length / 9;
-    appendLog("MESH", `${triCount.toLocaleString()} triangles  grid=${W}×${H}`);
-  }, [appendLog]);
+    appendLog("MESH", `${triCount.toLocaleString()} triangles  grid=${W}×${H}  seg=${hasSeg ? '✓' : '—'}`);
+  }, [appendLog, autoFitMesh]);
 
   // ── Build dense point cloud from depth map ───────────────────────────────────
   const renderPointCloud = useCallback((result: ScanResult) => {
@@ -699,6 +770,7 @@ function Home() {
     if (stage === 'DEPTH')   return 'text-yellow-400';
     if (stage === 'RENDER')  return 'text-green-400';
     if (stage === 'MESH')    return 'text-cyan-400';
+    if (stage === 'SEGMENT') return 'text-emerald-400';
     if (stage === 'POINTS')  return 'text-violet-400';
     if (stage === 'SUMMARY') return 'text-cyan-400';
     if (stage === 'CAPTURE') return 'text-primary/50';
@@ -889,8 +961,32 @@ function Home() {
           )}
         </div>
 
-        {/* Depth legend — bottom-centre, shown after first scan */}
-        {depthRange && (
+        {/* Legend — bottom-centre */}
+        {viewMode === 'mesh' ? (
+          /* Walkability legend — mesh mode */
+          <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+            <div className="bg-black/60 backdrop-blur-sm border border-primary/15 rounded-lg px-4 py-2.5 text-center">
+              <div className="text-[9px] text-primary/50 uppercase tracking-widest mb-2 font-bold font-mono">
+                Walkability
+              </div>
+              <div className="flex items-center gap-3">
+                <div className="flex items-center gap-1.5">
+                  <div className="w-3 h-3 rounded-sm bg-[#21b845] shadow-[0_0_6px_rgba(33,184,69,0.6)]" />
+                  <span className="font-mono text-[10px] text-[#21b845]">Walkable</span>
+                </div>
+                <div className="w-px h-4 bg-primary/20" />
+                <div className="flex items-center gap-1.5">
+                  <div className="w-3 h-3 rounded-sm bg-[#d12b2b] shadow-[0_0_6px_rgba(209,43,43,0.6)]" />
+                  <span className="font-mono text-[10px] text-[#d12b2b]">Non-walkable</span>
+                </div>
+              </div>
+              <div className="font-mono text-[8px] text-primary/30 mt-1.5">
+                Cityscapes · road / sidewalk / terrain
+              </div>
+            </div>
+          </div>
+        ) : depthRange ? (
+          /* Depth scale legend — voxel + point cloud modes */
           <div className="absolute bottom-5 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
             <div className="bg-black/60 backdrop-blur-sm border border-primary/15 rounded-lg px-4 py-2.5 text-center">
               <div className="text-[9px] text-primary/50 uppercase tracking-widest mb-1.5 font-bold font-mono">
@@ -910,7 +1006,7 @@ function Home() {
               </div>
             </div>
           </div>
-        )}
+        ) : null}
 
         {/* Dot-grid overlay */}
         <div className="absolute inset-0 pointer-events-none bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMCwyNTUsMTI4LDAuMDUpIi8+PC9zdmc+')] opacity-50 mix-blend-screen" />
