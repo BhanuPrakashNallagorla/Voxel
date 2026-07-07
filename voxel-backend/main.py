@@ -268,6 +268,13 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
             "occupied_voxels": 0,
             "depth_stats": {"min_m": d_min, "max_m": d_max, "mean_m": d_mean,
                             "valid_pixels": total_valid, "total_pixels": H * W},
+            "depth_map": [],
+            "grid_h": 0,
+            "grid_w": 0,
+            "grid_fx": req.fx,
+            "grid_fy": req.fy,
+            "grid_cx": req.cx,
+            "grid_cy": req.cy,
         }
         job["status"] = "done"
         _record(job, "SERIALIZE", "done", msg="0 voxels (no valid points in range)")
@@ -310,6 +317,33 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
             }
             for (vx, vy, vz), cnt in zip(occ_voxels, occ_counts)
         ]
+
+        # ── Subsample depth map for mesh reconstruction ───────────────────────
+        # Downsample to at most 160×120 so JSON payload stays reasonable.
+        # Depth values (metres) don't change with resolution; only pixel coords scale.
+        MESH_TARGET_W, MESH_TARGET_H = 160, 120
+        scale = min(1.0, MESH_TARGET_W / W, MESH_TARGET_H / H)
+        mesh_w = max(1, round(W * scale))
+        mesh_h = max(1, round(H * scale))
+        if scale < 1.0:
+            depth_small = np.array(
+                Image.fromarray(depth_array).resize((mesh_w, mesh_h), Image.BILINEAR),
+                dtype=np.float32,
+            )
+        else:
+            depth_small = depth_array
+            mesh_w, mesh_h = W, H
+
+        # Clamp invalid/out-of-range values to 0 so frontend can skip them
+        depth_small = np.where(
+            np.isfinite(depth_small) & (depth_small > 0) & (depth_small <= req.max_depth),
+            depth_small,
+            0.0,
+        )
+
+        # Round to 2 decimal places (1 cm precision) to reduce JSON size
+        depth_map_flat = depth_small.ravel().round(2).tolist()
+
         job["result"] = {
             "voxels": voxels_out,
             "total_points": total_points,
@@ -321,6 +355,15 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
                 "valid_pixels": total_valid,
                 "total_pixels": H * W,
             },
+            # Mesh reconstruction data — flat 1D array, reshape to (grid_h, grid_w)
+            "depth_map": depth_map_flat,
+            "grid_h": mesh_h,
+            "grid_w": mesh_w,
+            # Scaled camera intrinsics matching the subsampled grid
+            "grid_fx": round(req.fx * scale, 4),
+            "grid_fy": round(req.fy * scale, 4),
+            "grid_cx": round(req.cx * scale, 4),
+            "grid_cy": round(req.cy * scale, 4),
         }
     except Exception as exc:
         _record(job, "SERIALIZE", "error",
@@ -329,7 +372,7 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
     ser_s = time.perf_counter() - t4
     total_s = (time.perf_counter() - t0)
     _record(job, "SERIALIZE", "done",
-            msg=f"{ser_s*1000:.1f} ms  |  {len(voxels_out)} voxels  |  total {total_s:.2f} s")
+            msg=f"{ser_s*1000:.1f} ms  |  {len(voxels_out)} voxels  mesh={mesh_w}×{mesh_h}  |  total {total_s:.2f} s")
     logger.info(f"[{job_id}] SERIALIZE {ser_s*1000:.1f} ms  total={total_s:.2f} s")
     job["status"] = "done"
 

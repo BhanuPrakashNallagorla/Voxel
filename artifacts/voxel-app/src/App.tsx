@@ -48,6 +48,14 @@ interface ScanResult {
   total_points: number;
   occupied_voxels: number;
   depth_stats: { min_m: number; max_m: number; mean_m: number; valid_pixels: number; total_pixels: number };
+  // Mesh reconstruction — flat 1D depth map, reshape to (grid_h × grid_w)
+  depth_map?: number[];
+  grid_h?: number;
+  grid_w?: number;
+  grid_fx?: number;
+  grid_fy?: number;
+  grid_cx?: number;
+  grid_cy?: number;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -92,6 +100,7 @@ function Home() {
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const instancedMeshRef = useRef<THREE.InstancedMesh | null>(null);
+  const meshSurfaceRef = useRef<THREE.Mesh | null>(null);
   const frameIdRef = useRef<number>(0);
 
   // Last scan result — lets color-mode toggle recolor without a new scan
@@ -106,11 +115,14 @@ function Home() {
   const minPointsRef = useRef(2);
   const [focalLength, setFocalLength] = useState(525);
   const focalLengthRef = useRef(525);
+  const [depthJumpThreshold, setDepthJumpThreshold] = useState(0.3);
+  const depthJumpThresholdRef = useRef(0.3);
 
-  const handleVoxelSizeChange  = (v: number) => { voxelSizeRef.current = v;  setVoxelSize(v);  };
-  const handleMaxDepthChange   = (v: number) => { maxDepthRef.current = v;   setMaxDepth(v);   };
-  const handleMinPointsChange  = (v: number) => { minPointsRef.current = v;  setMinPoints(v);  };
-  const handleFocalLengthChange= (v: number) => { focalLengthRef.current = v;setFocalLength(v);};
+  const handleVoxelSizeChange        = (v: number) => { voxelSizeRef.current = v;          setVoxelSize(v);          };
+  const handleMaxDepthChange         = (v: number) => { maxDepthRef.current = v;            setMaxDepth(v);           };
+  const handleMinPointsChange        = (v: number) => { minPointsRef.current = v;           setMinPoints(v);          };
+  const handleFocalLengthChange      = (v: number) => { focalLengthRef.current = v;         setFocalLength(v);        };
+  const handleDepthJumpThresholdChange = (v: number) => { depthJumpThresholdRef.current = v; setDepthJumpThreshold(v); };
 
   // Running state
   const [isRunning, setIsRunning] = useState(false);
@@ -127,7 +139,19 @@ function Home() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
 
-  // Color mode toggle
+  // View mode toggle: voxel grid vs smooth mesh surface
+  const [viewMode, setViewMode] = useState<'voxel' | 'mesh'>('voxel');
+  const viewModeRef = useRef<'voxel' | 'mesh'>('voxel');
+
+  const handleViewModeToggle = useCallback(() => {
+    const next = viewModeRef.current === 'voxel' ? 'mesh' : 'voxel';
+    viewModeRef.current = next;
+    setViewMode(next);
+    if (instancedMeshRef.current) instancedMeshRef.current.visible = next === 'voxel';
+    if (meshSurfaceRef.current)   meshSurfaceRef.current.visible   = next === 'mesh';
+  }, []);
+
+  // Color mode toggle (voxel mode only)
   const [colorMode, setColorMode] = useState<'depth' | 'solid'>('depth');
   const colorModeRef = useRef<'depth' | 'solid'>('depth');
   const handleColorModeToggle = () => {
@@ -161,12 +185,10 @@ function Home() {
   }, [isRunning]);
 
   // ── Recolor existing voxels when color mode changes ─────────────────────────
-  // renderVoxels is stable (useCallback), so this only fires on actual mode change.
   useEffect(() => {
     if (lastResultRef.current) renderVoxels(lastResultRef.current);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [colorMode]); // intentionally omitting renderVoxels — it's stable but including it
-                   // would cause an extra render on mount; the ref covers the dependency.
+  }, [colorMode]);
 
   // ── Three.js init ───────────────────────────────────────────────────────────
   useEffect(() => {
@@ -201,31 +223,48 @@ function Home() {
     controls.dampingFactor = 0.05;
     controlsRef.current = controls;
 
-    // Lighting (kept for scene; MeshBasicMaterial ignores it but it's harmless)
-    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    // Lighting — AmbientLight + DirectionalLight for MeshStandardMaterial shading
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
     dirLight.position.set(5, 10, 5);
     scene.add(dirLight);
+    const fillLight = new THREE.DirectionalLight(0x8899ff, 0.3);
+    fillLight.position.set(-5, -2, -5);
+    scene.add(fillLight);
 
-    // Fog — matches bg color so distant voxels fade naturally
+    // Fog — matches bg color so distant geometry fades naturally
     scene.fog = new THREE.Fog(0x050508, 10, 28);
 
-    // Dimmed grid/axes so voxels stand out
+    // Grid / axes
     scene.add(new THREE.GridHelper(20, 20, 0x0c2a1e, 0x071510));
     scene.add(new THREE.AxesHelper(0.8));
 
-    // MeshBasicMaterial: ignores lighting entirely, so per-instance colors
-    // set via setColorAt() always show correctly without needing lights.
-    // (MeshLambertMaterial with vertexColors:true was black because BoxGeometry
-    //  has no 'color' vertex attribute — the shader read (0,0,0) and
-    //  multiplied the instance color against it.)
+    // ── Voxel InstancedMesh ──────────────────────────────────────────────────
     const geometry = new THREE.BoxGeometry(1, 1, 1);
     const material = new THREE.MeshBasicMaterial();
     const instancedMesh = new THREE.InstancedMesh(geometry, material, 50000);
     instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     instancedMesh.count = 0;
+    // Fix disappearing-on-camera-move bug: disable frustum culling so the
+    // InstancedMesh is never incorrectly culled when the bounding sphere is stale.
+    instancedMesh.frustumCulled = false;
     scene.add(instancedMesh);
     instancedMeshRef.current = instancedMesh;
+
+    // ── Mesh Surface (smooth triangulated depth reconstruction) ──────────────
+    const meshSurface = new THREE.Mesh(
+      new THREE.BufferGeometry(),
+      new THREE.MeshStandardMaterial({
+        color: 0xaaaaaa,
+        side: THREE.DoubleSide,
+        roughness: 0.75,
+        metalness: 0.05,
+      })
+    );
+    meshSurface.frustumCulled = false;
+    meshSurface.visible = false; // voxel mode is default
+    scene.add(meshSurface);
+    meshSurfaceRef.current = meshSurface;
 
     // WebGL context loss handling
     const handleContextLost = (e: Event) => {
@@ -304,10 +343,7 @@ function Home() {
     box.getCenter(center);
     const size = new THREE.Vector3();
     box.getSize(size);
-    // Add a voxel-size margin so the outermost cubes aren't clipped
     const radius = Math.max(size.x, size.y, size.z) * 0.5 + vSize * 2;
-    // Use whichever FOV axis is more constraining (vertical or horizontal).
-    // Vertical FOV is camera.fov. Horizontal FOV depends on the canvas aspect ratio.
     const aspect = canvas ? canvas.clientWidth / canvas.clientHeight : camera.aspect;
     const vFovRad = camera.fov * (Math.PI / 180);
     const hFovRad = 2 * Math.atan(Math.tan(vFovRad / 2) * aspect);
@@ -344,10 +380,9 @@ function Home() {
       matrix.scale(scale);
       mesh.setMatrixAt(i, matrix);
       if (isDepth) {
-        // Hue 0 (red) = near, hue 0.67 (blue) = far
         color.setHSL((v.depth / maxD) * 0.67, 1.0, 0.55);
       } else {
-        color.setHex(0x00ff80); // solid primary green
+        color.setHex(0x00ff80);
       }
       mesh.setColorAt(i, color);
     }
@@ -366,6 +401,91 @@ function Home() {
 
     appendLog("RENDER", `${voxels.length} voxels  depth=[${ds.min_m.toFixed(2)}–${ds.max_m.toFixed(2)} m]  pts=${result.total_points}`);
   }, [appendLog, autoFitCamera]);
+
+  // ── Build smooth mesh from depth map via grid triangulation ─────────────────
+  const renderMesh = useCallback((result: ScanResult) => {
+    const surface = meshSurfaceRef.current;
+    if (!surface) return;
+
+    const { depth_map, grid_h, grid_w, grid_fx, grid_fy, grid_cx, grid_cy } = result;
+    if (!depth_map || !grid_h || !grid_w || depth_map.length === 0) return;
+
+    const H = grid_h;
+    const W = grid_w;
+    const fx = grid_fx ?? focalLengthRef.current;
+    const fy = grid_fy ?? focalLengthRef.current;
+    const cx = grid_cx ?? W / 2;
+    const cy = grid_cy ?? H / 2;
+    const threshold = depthJumpThresholdRef.current;
+
+    // Back-project every pixel to 3-D (same pinhole formula as voxels, Y-flipped)
+    const vX = new Float32Array(H * W);
+    const vY = new Float32Array(H * W);
+    const vZ = new Float32Array(H * W);
+    const valid = new Uint8Array(H * W);
+
+    for (let r = 0; r < H; r++) {
+      for (let c = 0; c < W; c++) {
+        const d = depth_map[r * W + c];
+        const idx = r * W + c;
+        if (d > 0) {
+          vX[idx] = (c - cx) * d / fx;
+          vY[idx] = -((r - cy) * d / fy); // flip Y to match voxel coordinate system
+          vZ[idx] = d;
+          valid[idx] = 1;
+        }
+      }
+    }
+
+    // Triangulate every 2×2 block of adjacent pixels into 2 triangles.
+    // Skip quads where any vertex is invalid or the depth jump exceeds threshold
+    // (prevents smearing across foreground/background boundaries).
+    const positions: number[] = [];
+
+    for (let r = 0; r < H - 1; r++) {
+      for (let c = 0; c < W - 1; c++) {
+        const i00 = r * W + c;
+        const i01 = r * W + c + 1;
+        const i10 = (r + 1) * W + c;
+        const i11 = (r + 1) * W + c + 1;
+
+        if (!valid[i00] || !valid[i01] || !valid[i10] || !valid[i11]) continue;
+
+        const d00 = vZ[i00];
+        const d01 = vZ[i01];
+        const d10 = vZ[i10];
+        const d11 = vZ[i11];
+
+        const dMax = Math.max(d00, d01, d10, d11);
+        const dMin = Math.min(d00, d01, d10, d11);
+        if (dMax - dMin > threshold) continue;
+
+        // Triangle 1: top-left → bottom-left → top-right
+        positions.push(
+          vX[i00], vY[i00], vZ[i00],
+          vX[i10], vY[i10], vZ[i10],
+          vX[i01], vY[i01], vZ[i01],
+        );
+        // Triangle 2: top-right → bottom-left → bottom-right
+        positions.push(
+          vX[i01], vY[i01], vZ[i01],
+          vX[i10], vY[i10], vZ[i10],
+          vX[i11], vY[i11], vZ[i11],
+        );
+      }
+    }
+
+    // Dispose old geometry to free GPU memory
+    surface.geometry.dispose();
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
+    geo.computeVertexNormals(); // smooth shading from triangle normals
+    surface.geometry = geo;
+
+    const triCount = positions.length / 9;
+    appendLog("MESH", `${triCount.toLocaleString()} triangles  grid=${W}×${H}`);
+  }, [appendLog]);
 
   // ── Capture one frame from camera ────────────────────────────────────────────
   const captureFrame = (): string | null => {
@@ -435,10 +555,9 @@ function Home() {
         status = await res.json() as JobStatus;
       } catch (err: unknown) {
         appendLog("ERROR", `poll /depth/status/${jobId}: ${(err as Error).message}`);
-        continue; // keep retrying — transient network blip
+        continue;
       }
 
-      // Log any new stage events since last poll
       const stages = status.stages ?? [];
       for (let i = lastStageCount; i < stages.length; i++) {
         const s = stages[i];
@@ -453,7 +572,9 @@ function Home() {
       lastStageCount = stages.length;
 
       if (status.status === 'done' && status.result) {
+        // Update both representations — toggle switches between them instantly
         renderVoxels(status.result);
+        renderMesh(status.result);
         appendLog("SUMMARY", `total=${status.elapsed_s}s | voxels=${status.result.occupied_voxels} | pts=${status.result.total_points}`);
         setCurrentJobId(null);
         return;
@@ -463,34 +584,28 @@ function Home() {
         setCurrentJobId(null);
         return;
       }
-      // Still pending/running — keep polling
     }
   };
 
   // ── Main scan loop ───────────────────────────────────────────────────────────
   const loop = async () => {
-    if (loopActiveRef.current) return; // single-flight guard
+    if (loopActiveRef.current) return;
     loopActiveRef.current = true;
     try {
       while (isRunningRef.current) {
-        // Reset elapsed timer at the start of each scan cycle
         elapsedStartRef.current = Date.now();
         setElapsedSeconds(0);
 
         const jobId = await startScan();
         if (!jobId) {
-          // camera not ready — wait a bit before retrying
           await new Promise(r => setTimeout(r, 2000));
           continue;
         }
         await pollUntilDone(jobId);
-        // Brief pause between scans
         if (isRunningRef.current) await new Promise(r => setTimeout(r, 500));
       }
     } finally {
       loopActiveRef.current = false;
-      // Handle stop→start race: if user re-toggled before old loop fully exited,
-      // isRunningRef is already true but no loop is active — restart immediately.
       if (isRunningRef.current) {
         loop();
       } else {
@@ -511,6 +626,7 @@ function Home() {
     if (stage === 'ERROR')   return 'text-destructive';
     if (stage === 'DEPTH')   return 'text-yellow-400';
     if (stage === 'RENDER')  return 'text-green-400';
+    if (stage === 'MESH')    return 'text-cyan-400';
     if (stage === 'SUMMARY') return 'text-cyan-400';
     if (stage === 'CAPTURE') return 'text-primary/50';
     if (stage === 'START')   return 'text-primary/60';
@@ -531,10 +647,13 @@ function Home() {
             Grid Node
           </h1>
           <div className="grid grid-cols-2 gap-4">
-            <ControlSlider label="Voxel Size"   value={voxelSize}   min={0.05} max={1.0}  step={0.05} unit="m"  onChange={handleVoxelSizeChange} />
-            <ControlSlider label="Max Depth"    value={maxDepth}    min={1.0}  max={15.0} step={0.5}  unit="m"  onChange={handleMaxDepthChange} />
-            <ControlSlider label="Min Points"   value={minPoints}   min={1}    max={20}   step={1}    unit=""   onChange={handleMinPointsChange} />
-            <ControlSlider label="Focal Length" value={focalLength} min={200}  max={1000} step={25}   unit="px" onChange={handleFocalLengthChange} />
+            <ControlSlider label="Voxel Size"    value={voxelSize}          min={0.05} max={1.0}  step={0.05} unit="m"  onChange={handleVoxelSizeChange} />
+            <ControlSlider label="Max Depth"     value={maxDepth}           min={1.0}  max={15.0} step={0.5}  unit="m"  onChange={handleMaxDepthChange} />
+            <ControlSlider label="Min Points"    value={minPoints}          min={1}    max={20}   step={1}    unit=""   onChange={handleMinPointsChange} />
+            <ControlSlider label="Focal Length"  value={focalLength}        min={200}  max={1000} step={25}   unit="px" onChange={handleFocalLengthChange} />
+            <div className="col-span-2">
+              <ControlSlider label="Mesh Edge Gap" value={depthJumpThreshold} min={0.05} max={2.0}  step={0.05} unit="m"  onChange={handleDepthJumpThresholdChange} />
+            </div>
           </div>
         </div>
 
@@ -585,7 +704,6 @@ function Home() {
             {isRunning ? 'Halt Process' : 'Initialize Scan'}
           </button>
 
-          {/* Elapsed time + job ID — visible while running */}
           <div className={`flex justify-between items-center font-mono text-[11px] transition-opacity duration-300 ${isRunning ? 'opacity-100' : 'opacity-0'}`}>
             <span className="text-primary/60">
               {currentJobId ? `JOB: ${currentJobId}` : 'QUEUING...'}
@@ -641,6 +759,7 @@ function Home() {
               <div className="w-1.5 h-1.5 bg-primary rounded-full" />SYS_RENDERER_ACTIVE
             </div>
             <div>COORD_SYS: RIGHT_HANDED</div>
+            <div>MODE: <span className="text-primary/70">{viewMode === 'voxel' ? 'VOXEL_GRID' : 'MESH_SURFACE'}</span></div>
             <div>VOXEL_MAX: <span className="text-primary/70">50 000</span></div>
             <div>PATTERN: ASYNC_JOB_POLL</div>
             <div className="text-[10px] text-muted-foreground mt-2 pt-2 border-t border-primary/10">
@@ -649,13 +768,43 @@ function Home() {
           </div>
         </div>
 
-        {/* Color mode toggle — bottom-right */}
-        <button
-          onClick={handleColorModeToggle}
-          className="absolute bottom-5 right-5 z-10 font-mono text-[10px] uppercase tracking-widest bg-black/60 border border-primary/20 text-primary/70 px-3 py-1.5 rounded hover:bg-primary/10 hover:text-primary transition-colors backdrop-blur-sm"
-        >
-          {colorMode === 'depth' ? '⬛ DEPTH GRADIENT' : '🟩 SOLID FILL'}
-        </button>
+        {/* View mode toggle + color mode toggle — bottom-right */}
+        <div className="absolute bottom-5 right-5 z-10 flex flex-col gap-2 items-end">
+          {/* View mode segmented control */}
+          <div className="flex font-mono text-[10px] uppercase tracking-widest bg-black/60 border border-primary/20 rounded backdrop-blur-sm overflow-hidden">
+            <button
+              onClick={() => viewMode !== 'voxel' && handleViewModeToggle()}
+              className={`px-3 py-1.5 transition-colors ${
+                viewMode === 'voxel'
+                  ? 'bg-primary/20 text-primary'
+                  : 'text-primary/40 hover:text-primary/70 hover:bg-primary/10'
+              }`}
+            >
+              ⬛ Voxel Grid
+            </button>
+            <div className="w-px bg-primary/20" />
+            <button
+              onClick={() => viewMode !== 'mesh' && handleViewModeToggle()}
+              className={`px-3 py-1.5 transition-colors ${
+                viewMode === 'mesh'
+                  ? 'bg-primary/20 text-primary'
+                  : 'text-primary/40 hover:text-primary/70 hover:bg-primary/10'
+              }`}
+            >
+              🔷 Mesh Surface
+            </button>
+          </div>
+
+          {/* Color mode toggle — only relevant in voxel mode */}
+          {viewMode === 'voxel' && (
+            <button
+              onClick={handleColorModeToggle}
+              className="font-mono text-[10px] uppercase tracking-widest bg-black/60 border border-primary/20 text-primary/70 px-3 py-1.5 rounded hover:bg-primary/10 hover:text-primary transition-colors backdrop-blur-sm"
+            >
+              {colorMode === 'depth' ? '⬛ DEPTH GRADIENT' : '🟩 SOLID FILL'}
+            </button>
+          )}
+        </div>
 
         {/* Depth legend — bottom-centre, shown after first scan */}
         {depthRange && (
