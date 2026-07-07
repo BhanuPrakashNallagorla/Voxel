@@ -1,6 +1,12 @@
 """
-Voxel Occupancy Grid Backend
+Voxel Occupancy Grid Backend — async job pattern
 Depth Anything V2 Large (metric) → point cloud → voxelization
+
+Endpoints:
+  GET  /depth/health              — server + model liveness
+  GET  /depth/model_info          — detailed memory / device info
+  POST /depth/scan                — start a job, return job_id immediately
+  GET  /depth/status/{job_id}     — poll job progress / result
 """
 
 import os
@@ -10,6 +16,12 @@ import base64
 import io
 import logging
 import traceback
+import uuid
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from typing import Any, Optional
 
 import numpy as np
 from PIL import Image
@@ -18,9 +30,8 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
 
-# ─── Logging ────────────────────────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -28,8 +39,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voxel-backend")
 
-# ─── FastAPI app ─────────────────────────────────────────────────────────────
-app = FastAPI(title="Voxel Occupancy Grid API", version="1.0.0")
+# ─── FastAPI app ──────────────────────────────────────────────────────────────
+app = FastAPI(title="Voxel Occupancy Grid API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,7 +50,65 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Global model state ──────────────────────────────────────────────────────
+# ─── Thread pool (max 1 worker — serialises GPU/CPU inference) ────────────────
+_executor = ThreadPoolExecutor(max_workers=1)
+
+# ─── In-memory job store (capped at 50 entries) ───────────────────────────────
+MAX_JOBS = 50
+jobs: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_jobs_lock = threading.Lock()   # guards _add_job eviction logic
+
+
+def _add_job(job_id: str) -> dict:
+    """Create a blank job.  Evict only *terminal* (done/error) jobs when over cap.
+    Never evicts pending/running jobs — that would break in-flight polling.
+    If cap is exceeded and no terminal jobs exist, raises RuntimeError (429 upstream).
+    """
+    job: dict[str, Any] = {
+        "id": job_id,
+        "status": "pending",          # pending | running | done | error
+        "current_stage": None,
+        "stages": [],                 # list of stage-event dicts (see _record)
+        "result": None,
+        "created_at": time.time(),
+    }
+    with _jobs_lock:
+        jobs[job_id] = job
+        if len(jobs) > MAX_JOBS:
+            # Collect terminal job IDs in insertion order (oldest first)
+            terminal = [jid for jid, j in jobs.items()
+                        if j["status"] in ("done", "error") and jid != job_id]
+            need_to_free = len(jobs) - MAX_JOBS
+            if len(terminal) < need_to_free:
+                # Cannot safely evict — remove the new job and raise
+                del jobs[job_id]
+                raise RuntimeError(
+                    f"Job store full ({MAX_JOBS} entries, none terminal). "
+                    "Wait for a scan to complete before starting another."
+                )
+            for jid in terminal[:need_to_free]:
+                del jobs[jid]
+    return job
+
+
+def _record(job: dict, stage: str, state: str, msg: str = "", error: str = "") -> None:
+    """Append a stage-event entry and update job.current_stage.
+
+    state is one of: "start" | "done" | "error"
+    """
+    job["stages"].append({
+        "stage": stage,
+        "state": state,
+        "ts": round(time.time(), 3),
+        "msg": msg,
+        "error": error,
+    })
+    job["current_stage"] = stage
+    if state == "error":
+        job["status"] = "error"
+
+
+# ─── Global model state ───────────────────────────────────────────────────────
 depth_pipe = None
 model_name: Optional[str] = None
 model_load_error: Optional[str] = None
@@ -60,16 +129,13 @@ async def startup_event():
     device_label = f"CUDA:{device_id}" if device_id >= 0 else "CPU"
     logger.info(f"Device: {device_label}")
 
-    # Log memory info if CUDA
     if torch.cuda.is_available():
         total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
         logger.info(f"GPU memory: {total_mem:.1f} GB")
     else:
         import psutil
         ram = psutil.virtual_memory().total / 1e9
-        logger.info(
-            f"RAM: {ram:.1f} GB  — CPU inference will be slow (minutes per frame)"
-        )
+        logger.info(f"RAM: {ram:.1f} GB  — CPU inference will be slow (minutes per frame)")
         logger.warning(
             "No GPU detected. The Large model needs ~4–6 GB RAM. "
             "Expect very slow inference on CPU."
@@ -87,9 +153,7 @@ async def startup_event():
             logger.info(f"✅ Model loaded: {candidate}")
             break
         except Exception as exc:
-            logger.error(
-                f"❌ Failed to load {candidate}: {exc}\n{traceback.format_exc()}"
-            )
+            logger.error(f"❌ Failed to load {candidate}: {exc}\n{traceback.format_exc()}")
             depth_pipe = None
 
     if depth_pipe is None:
@@ -100,47 +164,181 @@ async def startup_event():
         logger.error(model_load_error)
 
 
-# ─── Request / response models ───────────────────────────────────────────────
-class ProcessFrameRequest(BaseModel):
+# ─── Request models ───────────────────────────────────────────────────────────
+class ScanRequest(BaseModel):
     image: str = Field(..., description="Base64-encoded JPEG/PNG frame")
-    # Camera intrinsics (pinhole model)
     fx: float = Field(525.0, description="Focal length x (pixels)")
     fy: float = Field(525.0, description="Focal length y (pixels)")
     cx: float = Field(320.0, description="Principal point x (pixels)")
     cy: float = Field(240.0, description="Principal point y (pixels)")
-    # Voxel grid parameters
     voxel_size: float = Field(0.25, gt=0, description="Voxel edge length (metres)")
     max_depth: float = Field(5.0, gt=0, description="Max depth range (metres)")
     min_points: int = Field(2, ge=1, description="Min points to mark voxel occupied")
 
 
-class Voxel(BaseModel):
-    x: float
-    y: float
-    z: float
-    depth: float  # Z coordinate (for coloring)
-    count: int
+# ─── Pipeline (runs in a background thread) ───────────────────────────────────
+def _run_pipeline(job_id: str, req: ScanRequest) -> None:
+    """Execute all 5 pipeline stages, writing progress into jobs[job_id]."""
+    job = jobs[job_id]
+    job["status"] = "running"
+
+    # ── Stage 1: Decode image ─────────────────────────────────────────────────
+    _record(job, "DECODE", "start")
+    t0 = time.perf_counter()
+    try:
+        b64 = req.image
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        img_bytes = base64.b64decode(b64)
+        pil_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        W, H = pil_image.size
+    except Exception as exc:
+        _record(job, "DECODE", "error",
+                error=f"{exc}\n{traceback.format_exc()}")
+        return
+    decode_s = time.perf_counter() - t0
+    _record(job, "DECODE", "done", msg=f"{decode_s*1000:.1f} ms  |  {W}×{H} px")
+    logger.info(f"[{job_id}] DECODE {decode_s*1000:.1f} ms")
+
+    # ── Stage 2: Depth inference ──────────────────────────────────────────────
+    _record(job, "DEPTH", "start")
+    t1 = time.perf_counter()
+    try:
+        result = depth_pipe(pil_image)
+        # Use predicted_depth tensor (metric metres).
+        # result["depth"] is a display-normalised PIL image — do NOT use it for geometry.
+        if "predicted_depth" in result:
+            pd = result["predicted_depth"]
+            if hasattr(pd, "squeeze"):
+                pd = pd.squeeze()
+            depth_array = pd.detach().cpu().numpy().astype(np.float32)
+        else:
+            logger.warning(f"[{job_id}] predicted_depth missing — falling back to depth PIL image")
+            raw = result["depth"]
+            depth_array = np.array(raw, dtype=np.float32) if isinstance(raw, Image.Image) \
+                else np.asarray(raw, dtype=np.float32)
+    except Exception as exc:
+        _record(job, "DEPTH", "error",
+                error=f"{exc}\n{traceback.format_exc()}")
+        return
+    depth_s = time.perf_counter() - t1
+
+    # Resize depth map to image dimensions if needed
+    if depth_array.shape != (H, W):
+        depth_pil = Image.fromarray(depth_array)
+        depth_array = np.array(depth_pil.resize((W, H), Image.BILINEAR), dtype=np.float32)
+
+    valid_mask = np.isfinite(depth_array) & (depth_array > 0)
+    total_valid = int(np.sum(valid_mask))
+    d_min = float(depth_array[valid_mask].min()) if total_valid else 0.0
+    d_max = float(depth_array[valid_mask].max()) if total_valid else 0.0
+    d_mean = float(depth_array[valid_mask].mean()) if total_valid else 0.0
+
+    _record(job, "DEPTH", "done",
+            msg=f"{depth_s*1000:.0f} ms  |  range [{d_min:.2f}–{d_max:.2f} m]  mean {d_mean:.2f} m")
+    logger.info(f"[{job_id}] DEPTH {depth_s*1000:.0f} ms  [{d_min:.2f}–{d_max:.2f} m]")
+
+    # ── Stage 3: Back-project to 3-D point cloud ──────────────────────────────
+    _record(job, "BACKPROJ", "start")
+    t2 = time.perf_counter()
+    try:
+        uu = np.arange(W, dtype=np.float32)
+        vv = np.arange(H, dtype=np.float32)
+        grid_u, grid_v = np.meshgrid(uu, vv)
+
+        Z = depth_array
+        range_mask = valid_mask & (Z <= req.max_depth)
+        Zf = Z[range_mask]
+        Xf = (grid_u[range_mask] - req.cx) * Zf / req.fx
+        Yf = (grid_v[range_mask] - req.cy) * Zf / req.fy
+        total_points = int(Xf.size)
+    except Exception as exc:
+        _record(job, "BACKPROJ", "error",
+                error=f"{exc}\n{traceback.format_exc()}")
+        return
+    bp_s = time.perf_counter() - t2
+    _record(job, "BACKPROJ", "done",
+            msg=f"{bp_s*1000:.1f} ms  |  {total_points:,} pts within {req.max_depth} m")
+    logger.info(f"[{job_id}] BACKPROJ {bp_s*1000:.1f} ms  {total_points:,} pts")
+
+    if total_points == 0:
+        job["result"] = {
+            "voxels": [],
+            "total_points": 0,
+            "occupied_voxels": 0,
+            "depth_stats": {"min_m": d_min, "max_m": d_max, "mean_m": d_mean,
+                            "valid_pixels": total_valid, "total_pixels": H * W},
+        }
+        job["status"] = "done"
+        _record(job, "SERIALIZE", "done", msg="0 voxels (no valid points in range)")
+        return
+
+    # ── Stage 4: Voxelization ─────────────────────────────────────────────────
+    _record(job, "VOXELIZE", "start")
+    t3 = time.perf_counter()
+    try:
+        vs = req.voxel_size
+        xi = np.floor(Xf / vs).astype(np.int32)
+        yi = np.floor(Yf / vs).astype(np.int32)
+        zi = np.floor(Zf / vs).astype(np.int32)
+        voxel_coords = np.column_stack([xi, yi, zi])
+        unique_voxels, counts = np.unique(voxel_coords, axis=0, return_counts=True)
+        occupied_mask_occ = counts >= req.min_points
+        occ_voxels = unique_voxels[occupied_mask_occ]
+        occ_counts = counts[occupied_mask_occ]
+    except Exception as exc:
+        _record(job, "VOXELIZE", "error",
+                error=f"{exc}\n{traceback.format_exc()}")
+        return
+    vox_s = time.perf_counter() - t3
+    _record(job, "VOXELIZE", "done",
+            msg=f"{vox_s*1000:.1f} ms  |  {len(occ_voxels):,} occupied voxels  (voxel={vs} m, min_pts={req.min_points})")
+    logger.info(f"[{job_id}] VOXELIZE {vox_s*1000:.1f} ms  {len(occ_voxels):,} voxels")
+
+    # ── Stage 5: Serialize result ─────────────────────────────────────────────
+    _record(job, "SERIALIZE", "start")
+    t4 = time.perf_counter()
+    try:
+        vs = req.voxel_size
+        voxels_out = [
+            {
+                "x": float((vx + 0.5) * vs),
+                "y": float((vy + 0.5) * vs),
+                "z": float((vz + 0.5) * vs),
+                "depth": float((vz + 0.5) * vs),  # Z = depth for coloring
+                "count": int(cnt),
+            }
+            for (vx, vy, vz), cnt in zip(occ_voxels, occ_counts)
+        ]
+        job["result"] = {
+            "voxels": voxels_out,
+            "total_points": total_points,
+            "occupied_voxels": len(voxels_out),
+            "depth_stats": {
+                "min_m": round(d_min, 3),
+                "max_m": round(d_max, 3),
+                "mean_m": round(d_mean, 3),
+                "valid_pixels": total_valid,
+                "total_pixels": H * W,
+            },
+        }
+    except Exception as exc:
+        _record(job, "SERIALIZE", "error",
+                error=f"{exc}\n{traceback.format_exc()}")
+        return
+    ser_s = time.perf_counter() - t4
+    total_s = (time.perf_counter() - t0)
+    _record(job, "SERIALIZE", "done",
+            msg=f"{ser_s*1000:.1f} ms  |  {len(voxels_out)} voxels  |  total {total_s:.2f} s")
+    logger.info(f"[{job_id}] SERIALIZE {ser_s*1000:.1f} ms  total={total_s:.2f} s")
+    job["status"] = "done"
 
 
-class DepthStats(BaseModel):
-    min_m: float
-    max_m: float
-    mean_m: float
-    valid_pixels: int
-    total_pixels: int
+# ─── Endpoints ────────────────────────────────────────────────────────────────
 
-
-class ProcessFrameResponse(BaseModel):
-    voxels: list[Voxel]
-    timings: dict[str, float]  # stage → seconds
-    depth_stats: DepthStats
-    total_points: int
-    occupied_voxels: int
-
-
-# ─── Endpoints ───────────────────────────────────────────────────────────────
 @app.get("/depth/health")
 def health():
+    """Liveness check — confirms server + model are alive independently of any job."""
     return {
         "status": "ok" if depth_pipe is not None else "model_not_loaded",
         "model": model_name,
@@ -151,23 +349,18 @@ def health():
 
 @app.get("/depth/model_info")
 def model_info():
-    mem_info = {}
+    mem_info: dict = {}
     if torch.cuda.is_available():
         props = torch.cuda.get_device_properties(0)
         mem_info["gpu_total_gb"] = round(props.total_memory / 1e9, 2)
-        mem_info["gpu_reserved_gb"] = round(
-            torch.cuda.memory_reserved(0) / 1e9, 2
-        )
-        mem_info["gpu_allocated_gb"] = round(
-            torch.cuda.memory_allocated(0) / 1e9, 2
-        )
+        mem_info["gpu_reserved_gb"] = round(torch.cuda.memory_reserved(0) / 1e9, 2)
+        mem_info["gpu_allocated_gb"] = round(torch.cuda.memory_allocated(0) / 1e9, 2)
     else:
         import psutil
         vm = psutil.virtual_memory()
         mem_info["ram_total_gb"] = round(vm.total / 1e9, 2)
         mem_info["ram_available_gb"] = round(vm.available / 1e9, 2)
         mem_info["ram_used_gb"] = round(vm.used / 1e9, 2)
-
     return {
         "model_name": model_name,
         "model_loaded": depth_pipe is not None,
@@ -175,180 +368,61 @@ def model_info():
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "memory": mem_info,
         "candidate_models": CANDIDATE_MODELS,
+        "active_jobs": len(jobs),
     }
 
 
-@app.post("/depth/process", response_model=ProcessFrameResponse)
-async def process_frame(req: ProcessFrameRequest):
+@app.post("/depth/scan")
+async def start_scan(req: ScanRequest):
+    """Start the depth pipeline in a background thread. Returns job_id immediately."""
     if depth_pipe is None:
         raise HTTPException(
             status_code=503,
             detail=model_load_error or "Depth model not loaded. Check startup logs.",
         )
 
-    timings: dict[str, float] = {}
-
-    # ── Stage 1: Decode image ────────────────────────────────────────────────
-    t0 = time.perf_counter()
+    job_id = uuid.uuid4().hex[:8]
     try:
-        # Strip data-URL prefix if present
-        b64 = req.image
-        if "," in b64:
-            b64 = b64.split(",", 1)[1]
-        img_bytes = base64.b64decode(b64)
-        pil_image = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-        W, H = pil_image.size
-    except Exception as exc:
-        logger.error(f"Image decode failed: {exc}")
-        raise HTTPException(status_code=400, detail=f"Image decode error: {exc}")
-    timings["decode_s"] = round(time.perf_counter() - t0, 4)
-    logger.info(
-        f"[stage 1/5] decoded image {W}×{H}  ({timings['decode_s']*1000:.1f} ms)"
-    )
+        job = _add_job(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    logger.info(f"[{job_id}] scan started")
 
-    # ── Stage 2: Depth inference ─────────────────────────────────────────────
-    t1 = time.perf_counter()
-    try:
-        result = depth_pipe(pil_image)
-        # HF depth-estimation pipeline returns two outputs:
-        #   result["predicted_depth"] — PyTorch tensor, raw metric values (metres for metric models)
-        #   result["depth"]           — PIL Image, display-normalized (NOT metric)
-        # We MUST use predicted_depth for correct 3-D back-projection.
-        if "predicted_depth" in result:
-            pd = result["predicted_depth"]
-            # Shape may be (1, H, W) or (H, W); squeeze out any leading batch dim.
-            if hasattr(pd, "squeeze"):
-                pd = pd.squeeze()
-            depth_array = pd.detach().cpu().numpy().astype(np.float32)
-            logger.info(
-                f"Using predicted_depth tensor  shape={depth_array.shape}  "
-                f"range=[{depth_array.min():.3f}, {depth_array.max():.3f}] m"
-            )
-        else:
-            # Fallback: older pipeline versions may only return "depth".
-            # NOTE: this path gives display-normalized values — accuracy is degraded.
-            logger.warning(
-                "predicted_depth not found in pipeline output — falling back to 'depth' "
-                "PIL image. Values may not be metric. Upgrade transformers if possible."
-            )
-            raw_depth = result["depth"]
-            if isinstance(raw_depth, Image.Image):
-                depth_array = np.array(raw_depth, dtype=np.float32)
-            else:
-                depth_array = np.asarray(raw_depth, dtype=np.float32)
-    except Exception as exc:
-        logger.error(f"Depth inference failed: {exc}\n{traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=f"Depth inference error: {exc}")
-    timings["depth_inference_s"] = round(time.perf_counter() - t1, 4)
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(_executor, _run_pipeline, job_id, req)
 
-    # Resize depth map to match image if needed
-    if depth_array.shape != (H, W):
-        depth_pil = Image.fromarray(depth_array)
-        depth_pil = depth_pil.resize((W, H), Image.BILINEAR)
-        depth_array = np.array(depth_pil, dtype=np.float32)
+    return {"job_id": job_id}
 
-    # The metric model outputs metres directly.
-    # Guard against zero/negative/NaN values.
-    valid_mask_all = np.isfinite(depth_array) & (depth_array > 0)
-    total_valid = int(np.sum(valid_mask_all))
-    total_pixels = H * W
 
-    d_min = float(np.min(depth_array[valid_mask_all])) if total_valid > 0 else 0.0
-    d_max = float(np.max(depth_array[valid_mask_all])) if total_valid > 0 else 0.0
-    d_mean = float(np.mean(depth_array[valid_mask_all])) if total_valid > 0 else 0.0
+@app.get("/depth/status/{job_id}")
+def get_status(job_id: str):
+    """Return the current state of a scan job — safe to call while pipeline is running."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+    job = jobs[job_id]
+    # Return a snapshot; never block on pipeline completion
+    return {
+        "id": job["id"],
+        "status": job["status"],
+        "current_stage": job["current_stage"],
+        "stages": list(job["stages"]),   # copy to avoid race on list resize
+        "result": job["result"],
+        "elapsed_s": round(time.time() - job["created_at"], 1),
+    }
 
-    logger.info(
-        f"[stage 2/5] depth inference done  ({timings['depth_inference_s']*1000:.1f} ms)  "
-        f"depth range: [{d_min:.2f} m – {d_max:.2f} m]  mean={d_mean:.2f} m"
-    )
 
-    # ── Stage 3: Back-project to 3D point cloud ──────────────────────────────
-    t2 = time.perf_counter()
-    uu = np.arange(W, dtype=np.float32)
-    vv = np.arange(H, dtype=np.float32)
-    grid_u, grid_v = np.meshgrid(uu, vv)  # both (H, W)
-
-    Z = depth_array
-    range_mask = valid_mask_all & (Z <= req.max_depth)
-
-    Zf = Z[range_mask]
-    Xf = (grid_u[range_mask] - req.cx) * Zf / req.fx
-    Yf = (grid_v[range_mask] - req.cy) * Zf / req.fy
-
-    total_points = int(Xf.size)
-    timings["backproject_s"] = round(time.perf_counter() - t2, 4)
-    logger.info(
-        f"[stage 3/5] back-projected {total_points:,} points within "
-        f"{req.max_depth} m  ({timings['backproject_s']*1000:.1f} ms)"
-    )
-
-    if total_points == 0:
-        logger.warning("No valid points after range filtering; returning empty grid.")
-        return ProcessFrameResponse(
-            voxels=[],
-            timings=timings,
-            depth_stats=DepthStats(
-                min_m=d_min,
-                max_m=d_max,
-                mean_m=d_mean,
-                valid_pixels=total_valid,
-                total_pixels=total_pixels,
-            ),
-            total_points=0,
-            occupied_voxels=0,
-        )
-
-    # ── Stage 4: Voxelization ────────────────────────────────────────────────
-    t3 = time.perf_counter()
-    vs = req.voxel_size
-    xi = np.floor(Xf / vs).astype(np.int32)
-    yi = np.floor(Yf / vs).astype(np.int32)
-    zi = np.floor(Zf / vs).astype(np.int32)
-
-    # Unique voxels + per-voxel point counts
-    voxel_coords = np.column_stack([xi, yi, zi])
-    # np.unique on (N,3) treats each row as a key
-    unique_voxels, counts = np.unique(voxel_coords, axis=0, return_counts=True)
-
-    occupied_mask = counts >= req.min_points
-    occupied_voxels_arr = unique_voxels[occupied_mask]
-    occupied_counts = counts[occupied_mask]
-
-    timings["voxelize_s"] = round(time.perf_counter() - t3, 4)
-    logger.info(
-        f"[stage 4/5] voxelized → {len(occupied_voxels_arr):,} occupied voxels "
-        f"(voxel_size={vs} m, min_pts={req.min_points})  "
-        f"({timings['voxelize_s']*1000:.1f} ms)"
-    )
-
-    # ── Stage 5: Serialise response ──────────────────────────────────────────
-    t4 = time.perf_counter()
-    voxels_out: list[Voxel] = []
-    for (vx, vy, vz), cnt in zip(occupied_voxels_arr, occupied_counts):
-        cx_m = (float(vx) + 0.5) * vs
-        cy_m = (float(vy) + 0.5) * vs
-        cz_m = (float(vz) + 0.5) * vs
-        voxels_out.append(
-            Voxel(x=cx_m, y=cy_m, z=cz_m, depth=cz_m, count=int(cnt))
-        )
-
-    timings["serialize_s"] = round(time.perf_counter() - t4, 4)
-    timings["total_s"] = round(sum(timings.values()), 4)
-    logger.info(
-        f"[stage 5/5] serialised {len(voxels_out)} voxels  "
-        f"total={timings['total_s']*1000:.0f} ms"
-    )
-
-    return ProcessFrameResponse(
-        voxels=voxels_out,
-        timings=timings,
-        depth_stats=DepthStats(
-            min_m=round(d_min, 3),
-            max_m=round(d_max, 3),
-            mean_m=round(d_mean, 3),
-            valid_pixels=total_valid,
-            total_pixels=total_pixels,
-        ),
-        total_points=total_points,
-        occupied_voxels=len(voxels_out),
-    )
+# Keep /depth/process for backward compatibility — delegates to the new job system
+# but blocks until done (use only for debugging, not production polling)
+@app.post("/depth/process")
+async def process_compat(req: ScanRequest):
+    """Legacy blocking endpoint — polls internally until done. Use /scan + /status instead."""
+    if depth_pipe is None:
+        raise HTTPException(status_code=503, detail=model_load_error or "Model not loaded.")
+    job_id = uuid.uuid4().hex[:8]
+    job = _add_job(job_id)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(_executor, _run_pipeline, job_id, req)
+    if job["status"] == "error":
+        last_err = next((s for s in reversed(job["stages"]) if s["state"] == "error"), None)
+        raise HTTPException(status_code=500, detail=last_err["error"] if last_err else "Pipeline error")
+    return job["result"]
