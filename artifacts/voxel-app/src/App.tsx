@@ -101,6 +101,7 @@ function Home() {
   const controlsRef = useRef<OrbitControls | null>(null);
   const instancedMeshRef = useRef<THREE.InstancedMesh | null>(null);
   const meshSurfaceRef = useRef<THREE.Mesh | null>(null);
+  const pointCloudRef = useRef<THREE.Points | null>(null);
   const frameIdRef = useRef<number>(0);
 
   // Last scan result — lets color-mode toggle recolor without a new scan
@@ -117,12 +118,19 @@ function Home() {
   const focalLengthRef = useRef(525);
   const [depthJumpThreshold, setDepthJumpThreshold] = useState(0.3);
   const depthJumpThresholdRef = useRef(0.3);
+  const [pointSize, setPointSize] = useState(2);
+  const pointSizeRef = useRef(2);
 
   const handleVoxelSizeChange        = (v: number) => { voxelSizeRef.current = v;          setVoxelSize(v);          };
   const handleMaxDepthChange         = (v: number) => { maxDepthRef.current = v;            setMaxDepth(v);           };
   const handleMinPointsChange        = (v: number) => { minPointsRef.current = v;           setMinPoints(v);          };
   const handleFocalLengthChange      = (v: number) => { focalLengthRef.current = v;         setFocalLength(v);        };
   const handleDepthJumpThresholdChange = (v: number) => { depthJumpThresholdRef.current = v; setDepthJumpThreshold(v); };
+  const handlePointSizeChange        = (v: number) => {
+    pointSizeRef.current = v;
+    setPointSize(v);
+    if (pointCloudRef.current) (pointCloudRef.current.material as THREE.PointsMaterial).size = v;
+  };
 
   // Running state
   const [isRunning, setIsRunning] = useState(false);
@@ -139,16 +147,16 @@ function Home() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [currentJobId, setCurrentJobId] = useState<string | null>(null);
 
-  // View mode toggle: voxel grid vs smooth mesh surface
-  const [viewMode, setViewMode] = useState<'voxel' | 'mesh'>('voxel');
-  const viewModeRef = useRef<'voxel' | 'mesh'>('voxel');
+  // View mode: voxel grid | smooth mesh surface | dense point cloud
+  const [viewMode, setViewMode] = useState<'voxel' | 'mesh' | 'points'>('voxel');
+  const viewModeRef = useRef<'voxel' | 'mesh' | 'points'>('voxel');
 
-  const handleViewModeToggle = useCallback(() => {
-    const next = viewModeRef.current === 'voxel' ? 'mesh' : 'voxel';
-    viewModeRef.current = next;
-    setViewMode(next);
-    if (instancedMeshRef.current) instancedMeshRef.current.visible = next === 'voxel';
-    if (meshSurfaceRef.current)   meshSurfaceRef.current.visible   = next === 'mesh';
+  const handleViewModeSelect = useCallback((mode: 'voxel' | 'mesh' | 'points') => {
+    viewModeRef.current = mode;
+    setViewMode(mode);
+    if (instancedMeshRef.current) instancedMeshRef.current.visible = mode === 'voxel';
+    if (meshSurfaceRef.current)   meshSurfaceRef.current.visible   = mode === 'mesh';
+    if (pointCloudRef.current)    pointCloudRef.current.visible    = mode === 'points';
   }, []);
 
   // Color mode toggle (voxel mode only)
@@ -265,6 +273,20 @@ function Home() {
     meshSurface.visible = false; // voxel mode is default
     scene.add(meshSurface);
     meshSurfaceRef.current = meshSurface;
+
+    // ── Dense Point Cloud ────────────────────────────────────────────────────
+    const pointCloud = new THREE.Points(
+      new THREE.BufferGeometry(),
+      new THREE.PointsMaterial({
+        size: pointSizeRef.current,
+        vertexColors: true,
+        sizeAttenuation: true,
+      })
+    );
+    pointCloud.frustumCulled = false;
+    pointCloud.visible = false;
+    scene.add(pointCloud);
+    pointCloudRef.current = pointCloud;
 
     // WebGL context loss handling
     const handleContextLost = (e: Event) => {
@@ -487,6 +509,55 @@ function Home() {
     appendLog("MESH", `${triCount.toLocaleString()} triangles  grid=${W}×${H}`);
   }, [appendLog]);
 
+  // ── Build dense point cloud from depth map ───────────────────────────────────
+  const renderPointCloud = useCallback((result: ScanResult) => {
+    const cloud = pointCloudRef.current;
+    if (!cloud) return;
+
+    const { depth_map, grid_h, grid_w, grid_fx, grid_fy, grid_cx, grid_cy } = result;
+    if (!depth_map || !grid_h || !grid_w || depth_map.length === 0) return;
+
+    const H = grid_h;
+    const W = grid_w;
+    const fx = grid_fx ?? focalLengthRef.current;
+    const fy = grid_fy ?? focalLengthRef.current;
+    const cx = grid_cx ?? W / 2;
+    const cy = grid_cy ?? H / 2;
+    const maxD = maxDepthRef.current;
+
+    // Pre-allocate at max size — will slice if fewer valid pixels
+    const maxPts = H * W;
+    const positions = new Float32Array(maxPts * 3);
+    const colors    = new Float32Array(maxPts * 3);
+    const tmpColor  = new THREE.Color();
+    let n = 0;
+
+    for (let r = 0; r < H; r++) {
+      for (let c = 0; c < W; c++) {
+        const d = depth_map[r * W + c];
+        if (d <= 0) continue;
+        const base = n * 3;
+        positions[base]     = (c - cx) * d / fx;
+        positions[base + 1] = -((r - cy) * d / fy); // Y-flip matches voxel coord system
+        positions[base + 2] = d;
+        // Red→blue depth gradient (hue 0 = near, 0.67 = far) — same as voxel depth mode
+        tmpColor.setHSL((d / maxD) * 0.67, 1.0, 0.55);
+        colors[base]     = tmpColor.r;
+        colors[base + 1] = tmpColor.g;
+        colors[base + 2] = tmpColor.b;
+        n++;
+      }
+    }
+
+    cloud.geometry.dispose();
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions.slice(0, n * 3), 3));
+    geo.setAttribute('color',    new THREE.BufferAttribute(colors.slice(0, n * 3), 3));
+    cloud.geometry = geo;
+
+    appendLog("POINTS", `${n.toLocaleString()} pts  grid=${W}×${H}`);
+  }, [appendLog]);
+
   // ── Capture one frame from camera ────────────────────────────────────────────
   const captureFrame = (): string | null => {
     const video = videoRef.current;
@@ -572,9 +643,10 @@ function Home() {
       lastStageCount = stages.length;
 
       if (status.status === 'done' && status.result) {
-        // Update both representations — toggle switches between them instantly
+        // Update all three representations — toggle switches between them instantly
         renderVoxels(status.result);
         renderMesh(status.result);
+        renderPointCloud(status.result);
         appendLog("SUMMARY", `total=${status.elapsed_s}s | voxels=${status.result.occupied_voxels} | pts=${status.result.total_points}`);
         setCurrentJobId(null);
         return;
@@ -627,6 +699,7 @@ function Home() {
     if (stage === 'DEPTH')   return 'text-yellow-400';
     if (stage === 'RENDER')  return 'text-green-400';
     if (stage === 'MESH')    return 'text-cyan-400';
+    if (stage === 'POINTS')  return 'text-violet-400';
     if (stage === 'SUMMARY') return 'text-cyan-400';
     if (stage === 'CAPTURE') return 'text-primary/50';
     if (stage === 'START')   return 'text-primary/60';
@@ -651,9 +724,8 @@ function Home() {
             <ControlSlider label="Max Depth"     value={maxDepth}           min={1.0}  max={15.0} step={0.5}  unit="m"  onChange={handleMaxDepthChange} />
             <ControlSlider label="Min Points"    value={minPoints}          min={1}    max={20}   step={1}    unit=""   onChange={handleMinPointsChange} />
             <ControlSlider label="Focal Length"  value={focalLength}        min={200}  max={1000} step={25}   unit="px" onChange={handleFocalLengthChange} />
-            <div className="col-span-2">
-              <ControlSlider label="Mesh Edge Gap" value={depthJumpThreshold} min={0.05} max={2.0}  step={0.05} unit="m"  onChange={handleDepthJumpThresholdChange} />
-            </div>
+            <ControlSlider label="Mesh Edge Gap" value={depthJumpThreshold} min={0.05} max={2.0}  step={0.05} unit="m"  onChange={handleDepthJumpThresholdChange} />
+            <ControlSlider label="Point Size"   value={pointSize}          min={1}    max={10}   step={0.5}  unit="px" onChange={handlePointSizeChange} />
           </div>
         </div>
 
@@ -759,7 +831,7 @@ function Home() {
               <div className="w-1.5 h-1.5 bg-primary rounded-full" />SYS_RENDERER_ACTIVE
             </div>
             <div>COORD_SYS: RIGHT_HANDED</div>
-            <div>MODE: <span className="text-primary/70">{viewMode === 'voxel' ? 'VOXEL_GRID' : 'MESH_SURFACE'}</span></div>
+            <div>MODE: <span className="text-primary/70">{viewMode === 'voxel' ? 'VOXEL_GRID' : viewMode === 'mesh' ? 'MESH_SURFACE' : 'POINT_CLOUD'}</span></div>
             <div>VOXEL_MAX: <span className="text-primary/70">50 000</span></div>
             <div>PATTERN: ASYNC_JOB_POLL</div>
             <div className="text-[10px] text-muted-foreground mt-2 pt-2 border-t border-primary/10">
@@ -770,28 +842,39 @@ function Home() {
 
         {/* View mode toggle + color mode toggle — bottom-right */}
         <div className="absolute bottom-5 right-5 z-10 flex flex-col gap-2 items-end">
-          {/* View mode segmented control */}
+          {/* View mode segmented control — 3 options */}
           <div className="flex font-mono text-[10px] uppercase tracking-widest bg-black/60 border border-primary/20 rounded backdrop-blur-sm overflow-hidden">
             <button
-              onClick={() => viewMode !== 'voxel' && handleViewModeToggle()}
+              onClick={() => handleViewModeSelect('voxel')}
               className={`px-3 py-1.5 transition-colors ${
                 viewMode === 'voxel'
                   ? 'bg-primary/20 text-primary'
                   : 'text-primary/40 hover:text-primary/70 hover:bg-primary/10'
               }`}
             >
-              ⬛ Voxel Grid
+              ⬛ Voxel
             </button>
             <div className="w-px bg-primary/20" />
             <button
-              onClick={() => viewMode !== 'mesh' && handleViewModeToggle()}
+              onClick={() => handleViewModeSelect('mesh')}
               className={`px-3 py-1.5 transition-colors ${
                 viewMode === 'mesh'
                   ? 'bg-primary/20 text-primary'
                   : 'text-primary/40 hover:text-primary/70 hover:bg-primary/10'
               }`}
             >
-              🔷 Mesh Surface
+              🔷 Mesh
+            </button>
+            <div className="w-px bg-primary/20" />
+            <button
+              onClick={() => handleViewModeSelect('points')}
+              className={`px-3 py-1.5 transition-colors ${
+                viewMode === 'points'
+                  ? 'bg-primary/20 text-primary'
+                  : 'text-primary/40 hover:text-primary/70 hover:bg-primary/10'
+              }`}
+            >
+              ✦ Points
             </button>
           </div>
 
