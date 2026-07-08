@@ -49,6 +49,20 @@ interface ScanResult {
   grid_cy?: number;
 }
 
+/** Compact past-frame snapshot stored for multi-frame accumulation. */
+interface FrameSnapshot {
+  depth_map:   number[];
+  seg_map:     number[];
+  grid_h:      number;
+  grid_w:      number;
+  grid_fx:     number;
+  grid_fy:     number;
+  grid_cx:     number;
+  grid_cy:     number;
+  timestamp:   number;
+  orientation: { alpha: number; beta: number; gamma: number } | null;
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function fmtElapsed(s: number): string {
@@ -88,6 +102,29 @@ const SectionLabel = ({ title }: { title: string }) => (
   </div>
 );
 
+/** Minimal on/off pill toggle. */
+const TogglePill = ({ label, value, onChange }: {
+  label: string; value: boolean; onChange: (v: boolean) => void;
+}) => (
+  <div className="flex items-center justify-between py-0.5">
+    <span className="text-xs text-muted-foreground/80 uppercase tracking-widest font-bold">{label}</span>
+    <button
+      onClick={() => onChange(!value)}
+      className={`relative w-10 h-5 rounded-full transition-colors duration-200 border ${
+        value
+          ? 'bg-primary/20 border-primary shadow-[0_0_8px_rgba(0,255,128,0.35)]'
+          : 'bg-black border-border/60'
+      }`}
+    >
+      <span className={`absolute top-0.5 w-4 h-4 rounded-full transition-all duration-200 ${
+        value
+          ? 'left-5 bg-primary shadow-[0_0_6px_rgba(0,255,128,0.8)]'
+          : 'left-0.5 bg-muted-foreground/50'
+      }`} />
+    </button>
+  </div>
+);
+
 // ─── Main component ───────────────────────────────────────────────────────────
 
 function Home() {
@@ -105,6 +142,28 @@ function Home() {
   const meshSurfaceRef = useRef<THREE.Mesh | null>(null);
   const frameIdRef     = useRef<number>(0);
 
+  // Two materials: walkability vertex colors  /  UV-mapped camera texture
+  const meshWalkMatRef = useRef<THREE.MeshStandardMaterial | null>(null);
+  const meshTexMatRef  = useRef<THREE.MeshStandardMaterial | null>(null);
+  const meshTextureRef = useRef<THREE.Texture | null>(null);
+
+  // Multi-frame accumulation
+  const frameBufferRef    = useRef<FrameSnapshot[]>([]);
+  const [accumEnabled, setAccumEnabled] = useState(false);
+  const accumEnabledRef   = useRef(false);
+  const [accumFrames, setAccumFrames]   = useState(3);
+  const accumFramesRef    = useRef(3);
+
+  // Device orientation (IMU)
+  const orientationRef          = useRef<{ alpha: number; beta: number; gamma: number } | null>(null);
+  const orientationAvailableRef = useRef(false);
+  const [orientAvailable, setOrientAvailable] = useState(false);
+
+  // Mesh view mode
+  const [meshViewMode, setMeshViewMode] = useState<'walkability' | 'texture'>('walkability');
+  const meshViewModeRef = useRef<'walkability' | 'texture'>('walkability');
+  const [hasMesh, setHasMesh]           = useState(false);
+
   // ── Control state + refs ──────────────────────────────────────────────────
   const [maxDepth, setMaxDepth]                     = useState(5.0);
   const maxDepthRef                                 = useRef(5.0);
@@ -113,24 +172,27 @@ function Home() {
   const [depthJumpThreshold, setDepthJumpThreshold] = useState(0.3);
   const depthJumpThresholdRef                       = useRef(0.3);
 
-  const handleMaxDepthChange = (v: number) => {
-    maxDepthRef.current = v; setMaxDepth(v);
-  };
-  const handleFocalLengthChange = (v: number) => {
-    focalLengthRef.current = v; setFocalLength(v);
-  };
-  const handleDepthJumpThresholdChange = (v: number) => {
-    depthJumpThresholdRef.current = v; setDepthJumpThreshold(v);
+  const handleMaxDepthChange           = (v: number) => { maxDepthRef.current = v;           setMaxDepth(v);           };
+  const handleFocalLengthChange        = (v: number) => { focalLengthRef.current = v;        setFocalLength(v);        };
+  const handleDepthJumpThresholdChange = (v: number) => { depthJumpThresholdRef.current = v; setDepthJumpThreshold(v); };
+  const handleAccumEnabledChange       = (v: boolean)=> { accumEnabledRef.current = v;       setAccumEnabled(v);       };
+  const handleAccumFramesChange        = (v: number) => { accumFramesRef.current = v;        setAccumFrames(v);        };
+
+  const handleMeshViewToggle = () => {
+    const next: 'walkability' | 'texture' =
+      meshViewModeRef.current === 'walkability' ? 'texture' : 'walkability';
+    meshViewModeRef.current = next;
+    setMeshViewMode(next);
   };
 
   // ── Running / job state ──────────────────────────────────────────────────
-  const [isRunning, setIsRunning]       = useState(false);
-  const isRunningRef                    = useRef(false);
-  const loopActiveRef                   = useRef(false);
+  const [isRunning, setIsRunning]           = useState(false);
+  const isRunningRef                        = useRef(false);
+  const loopActiveRef                       = useRef(false);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
-  const elapsedStartRef                 = useRef<number | null>(null);
-  const [currentJobId, setCurrentJobId] = useState<string | null>(null);
-  const [currentStage, setCurrentStage] = useState<string | null>(null);
+  const elapsedStartRef                     = useRef<number | null>(null);
+  const [currentJobId, setCurrentJobId]     = useState<string | null>(null);
+  const [currentStage, setCurrentStage]     = useState<string | null>(null);
 
   // ── UI state ─────────────────────────────────────────────────────────────
   const [webGLError, setWebGLError] = useState<string | null>(null);
@@ -185,16 +247,15 @@ function Home() {
     renderer.setClearColor(0x050508);
     rendererRef.current = renderer;
 
-    // OrbitControls — smooth, controlled movement
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping  = true;
-    controls.dampingFactor  = 0.08;
-    controls.rotateSpeed    = 0.5;
-    controls.zoomSpeed      = 0.7;
-    controls.panSpeed       = 0.6;
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.rotateSpeed   = 0.5;
+    controls.zoomSpeed     = 0.7;
+    controls.panSpeed      = 0.6;
     controlsRef.current = controls;
 
-    // Lighting
+    // ── Lighting — kept active for both material modes ─────────────────────
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
     dirLight.position.set(5, 10, 5);
@@ -203,10 +264,8 @@ function Home() {
     fillLight.position.set(-5, -2, -5);
     scene.add(fillLight);
 
-    // Fog — subtle depth perception
     scene.fog = new THREE.Fog(0x050508, 8, 25);
 
-    // Grid / axes — very dim so mesh stands out
     const gridHelper = new THREE.GridHelper(20, 20, 0x061208, 0x040c06);
     (gridHelper.material as THREE.Material).opacity = 0.4;
     (gridHelper.material as THREE.Material).transparent = true;
@@ -216,32 +275,40 @@ function Home() {
     (axesHelper.material as THREE.Material).transparent = true;
     scene.add(axesHelper);
 
-    // Mesh surface — vertex colors driven by walkability seg map
-    const meshSurface = new THREE.Mesh(
-      new THREE.BufferGeometry(),
-      new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        color: 0xffffff,
-        side: THREE.DoubleSide,
-        roughness: 0.72,
-        metalness: 0.04,
-        flatShading: false,
-      })
-    );
+    // ── Material A: walkability vertex colors ──────────────────────────────
+    const walkMat = new THREE.MeshStandardMaterial({
+      vertexColors: true,
+      color: 0xffffff,
+      side: THREE.DoubleSide,
+      roughness: 0.72,
+      metalness: 0.04,
+      flatShading: false,
+    });
+    meshWalkMatRef.current = walkMat;
+
+    // ── Material B: UV-mapped camera texture ───────────────────────────────
+    const texMat = new THREE.MeshStandardMaterial({
+      side: THREE.DoubleSide,
+      roughness: 0.8,
+      metalness: 0.0,
+      flatShading: false,
+    });
+    meshTexMatRef.current = texMat;
+
+    const meshSurface = new THREE.Mesh(new THREE.BufferGeometry(), walkMat);
     meshSurface.frustumCulled = false;
     scene.add(meshSurface);
     meshSurfaceRef.current = meshSurface;
 
-    // WebGL context loss handling
     const handleContextLost = (e: Event) => {
       e.preventDefault();
       cancelAnimationFrame(frameIdRef.current);
       isRunningRef.current = false;
       setIsRunning(false);
-      setWebGLError('WebGL context was lost (GPU reset or tab backgrounded). Reload to restore 3D rendering.');
+      setWebGLError('WebGL context was lost. Reload to restore 3D rendering.');
     };
     const handleContextRestored = () => setWebGLError(null);
-    canvasRef.current.addEventListener('webglcontextlost', handleContextLost, false);
+    canvasRef.current.addEventListener('webglcontextlost',    handleContextLost,    false);
     canvasRef.current.addEventListener('webglcontextrestored', handleContextRestored, false);
 
     const animate = () => {
@@ -269,7 +336,76 @@ function Home() {
     };
   }, []);
 
-  // ── Camera init ───────────────────────────────────────────────────────────
+  // ── DeviceOrientation (IMU) — for multi-frame motion estimation ───────────
+  // orientHandler is stable: defined once and attached below (conditionally).
+  const orientHandlerRef = useRef<((e: DeviceOrientationEvent) => void) | null>(null);
+  useEffect(() => {
+    const handler = (e: DeviceOrientationEvent) => {
+      if (e.alpha === null) return;
+      orientationRef.current = {
+        alpha: e.alpha ?? 0,
+        beta:  e.beta  ?? 0,
+        gamma: e.gamma ?? 0,
+      };
+      if (!orientationAvailableRef.current) {
+        orientationAvailableRef.current = true;
+        setOrientAvailable(true);
+        appendLog("ORIENT", "DeviceOrientation API active — orientation data will be logged with each frame");
+      }
+    };
+    orientHandlerRef.current = handler;
+
+    // iOS 13+ requires requestPermission() to be called from a user gesture.
+    // On non-iOS browsers just attach immediately; on iOS we wait for the first
+    // scan-start click (requestOrientPermission is called from toggleRunning).
+    type DOE = typeof DeviceOrientationEvent & { requestPermission?: () => Promise<string> };
+    const needsGesture = typeof (DeviceOrientationEvent as DOE).requestPermission === 'function';
+    if (!needsGesture) {
+      window.addEventListener('deviceorientation', handler);
+    }
+
+    return () => window.removeEventListener('deviceorientation', handler);
+  }, [appendLog]);
+
+  /** Called from the scan-start user gesture so iOS grants orientation access. */
+  const requestOrientPermission = () => {
+    type DOE = typeof DeviceOrientationEvent & { requestPermission?: () => Promise<string> };
+    const requestPerm = (DeviceOrientationEvent as DOE).requestPermission;
+    if (typeof requestPerm !== 'function') return; // already attached on non-iOS
+    const handler = orientHandlerRef.current;
+    if (!handler) return;
+    requestPerm()
+      .then(state => {
+        if (state === 'granted') window.addEventListener('deviceorientation', handler);
+        else appendLog("ORIENT", "Orientation permission denied — minimal-movement assumption in use for accumulation");
+      })
+      .catch(() => appendLog("ORIENT", "Orientation API unavailable on this device"));
+  };
+
+  // ── Switch material when view mode is toggled ─────────────────────────────
+  useEffect(() => {
+    const surface = meshSurfaceRef.current;
+    const walkMat = meshWalkMatRef.current;
+    const texMat  = meshTexMatRef.current;
+    if (!surface || !walkMat || !texMat) return;
+
+    if (meshViewMode === 'texture') {
+      if (meshTextureRef.current) {
+        texMat.map = meshTextureRef.current;
+        texMat.needsUpdate = true;
+        surface.material = texMat;
+      } else {
+        // No texture captured yet — stay on walkability and warn
+        appendLog("VIEW", "Texture not available — complete a scan first to capture the camera frame");
+        meshViewModeRef.current = 'walkability';
+        setMeshViewMode('walkability');
+      }
+    } else {
+      surface.material = walkMat;
+    }
+  }, [meshViewMode, appendLog]);
+
+  // ── Camera stream ─────────────────────────────────────────────────────────
   useEffect(() => {
     navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 640 }, height: { ideal: 480 } },
@@ -298,19 +434,15 @@ function Home() {
     const camera   = cameraRef.current;
     const controls = controlsRef.current;
     if (!camera || !controls) return;
-
     geo.computeBoundingBox();
     const box = geo.boundingBox;
     if (!box) return;
-
     const center = new THREE.Vector3();
     box.getCenter(center);
     const size = new THREE.Vector3();
     box.getSize(size);
     const diagRadius = size.length() * 0.5;
-
     controls.target.copy(center);
-
     const vFovRad = camera.fov * (Math.PI / 180);
     const fitDist = (diagRadius / Math.tan(vFovRad / 2)) * 1.35;
     camera.position.set(
@@ -319,16 +451,52 @@ function Home() {
       center.z - fitDist * 0.9,
     );
     camera.lookAt(center);
-
     controls.minDistance = Math.max(0.4, diagRadius * 0.15);
     controls.maxDistance = diagRadius * 5;
     controls.update();
   }, []);
 
-  // ── Render mesh with walkability vertex colors ────────────────────────────
+  // ── Capture video frame → base64 JPEG + UV texture snapshot ─────────────
+  const captureFrame = (): string | null => {
+    const video  = videoRef.current;
+    const canvas = captureCanvasRef.current;
+    if (!video || !canvas) return null;
+    const ctx = canvas.getContext('2d');
+    if (!ctx || video.videoWidth === 0) return null;
+    canvas.width  = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    appendLog("CAPTURE", `${canvas.width}×${canvas.height} px`);
+
+    // ── Save a detached snapshot as Three.js UV texture ─────────────────────
+    // A new canvas is created so it isn't overwritten when the next frame is
+    // captured. This snapshot is paired with the depth result that returns later.
+    try {
+      const snap = document.createElement('canvas');
+      snap.width  = canvas.width;
+      snap.height = canvas.height;
+      snap.getContext('2d')!.drawImage(canvas, 0, 0);
+      const tex = new THREE.CanvasTexture(snap);
+      // flipY=false: UV (0,0) maps to canvas top-left, matching v = row / (H-1)
+      tex.flipY = false;
+      // Dispose AFTER the new texture is ready so the material never holds a
+      // reference to a disposed map while still being rendered.
+      const prev = meshTextureRef.current;
+      meshTextureRef.current = tex;
+      if (prev) prev.dispose();
+    } catch {
+      /* non-fatal — texture mode will be unavailable for this scan */
+    }
+
+    return canvas.toDataURL('image/jpeg', 0.85).replace(/^data:image\/jpeg;base64,/, "");
+  };
+
+  // ── Render mesh: walkability vertex colors + UV texture + accumulation ────
   const renderMesh = useCallback((result: ScanResult) => {
-    const surface = meshSurfaceRef.current;
-    if (!surface) return;
+    const surface  = meshSurfaceRef.current;
+    const walkMat  = meshWalkMatRef.current;
+    const texMat   = meshTexMatRef.current;
+    if (!surface || !walkMat || !texMat) return;
 
     const { depth_map, seg_map, grid_h, grid_w, grid_fx, grid_fy, grid_cx, grid_cy } = result;
     if (!depth_map || !grid_h || !grid_w || depth_map.length === 0) return;
@@ -341,7 +509,71 @@ function Home() {
     const cy = grid_cy ?? H / 2;
     const threshold = depthJumpThresholdRef.current;
     const hasSeg    = !!(seg_map && seg_map.length === H * W);
+    const t0Mesh    = performance.now();
 
+    // ── [1] Multi-frame accumulation: weighted depth-map merge ────────────
+    // Historical frames are stored in camera-space depth maps.  Because we
+    // assume minimal motion between consecutive frames (and log when real
+    // orientation data is / isn't available), a pixel-wise weighted average
+    // is a valid first approximation — it fills gaps and reduces noise.
+    //
+    // When DeviceOrientation data IS available we log the inter-frame delta so
+    // you can see how much the device moved; full SE(3) compensation would
+    // require remapping pixels via the rotation — logged as a future improvement.
+    let effectiveDepth: number[] = depth_map;
+    let currentPts = 0, histPts = 0;
+    const usingAccum = accumEnabledRef.current && frameBufferRef.current.length > 0;
+
+    if (usingAccum) {
+      const N      = H * W;
+      const merged = new Float32Array(N);
+      const cnt    = new Float32Array(N);
+
+      // Current frame — weight 1.0
+      for (let i = 0; i < N; i++) {
+        if (depth_map[i] > 0) { merged[i] = depth_map[i]; cnt[i] = 1.0; currentPts++; }
+      }
+
+      // Historical frames — exponential decay (most recent = highest weight)
+      const buf = frameBufferRef.current;
+      for (let fi = buf.length - 1; fi >= 0; fi--) {
+        const frame = buf[fi];
+        if (frame.grid_h !== H || frame.grid_w !== W) continue;
+        const age = buf.length - fi;       // 1 = most recent historical
+        const wt  = Math.pow(0.8, age);
+        for (let i = 0; i < N; i++) {
+          if (frame.depth_map[i] > 0) {
+            merged[i] += frame.depth_map[i] * wt;
+            cnt[i]    += wt;
+            histPts++;
+          }
+        }
+      }
+
+      effectiveDepth = [];
+      for (let i = 0; i < N; i++) {
+        effectiveDepth.push(cnt[i] > 1e-6 ? merged[i] / cnt[i] : 0);
+      }
+
+      // Orientation delta between oldest and newest stored frame (informational)
+      let orientTag = '·orient:— (minimal-movement assumed)';
+      if (orientationAvailableRef.current && buf.length > 0) {
+        const oldest = buf[0].orientation;
+        const cur    = orientationRef.current;
+        if (oldest && cur) {
+          const da = Math.abs(cur.alpha - oldest.alpha).toFixed(1);
+          const db = Math.abs(cur.beta  - oldest.beta ).toFixed(1);
+          const dg = Math.abs(cur.gamma - oldest.gamma).toFixed(1);
+          orientTag = `·orient:✓ Δα=${da}° Δβ=${db}° Δγ=${dg}° (rotation-compensated mesh: future improvement)`;
+        }
+      }
+
+      appendLog("ACCUM",
+        `${buf.length + 1} frames · ${currentPts.toLocaleString()} cur + ${histPts.toLocaleString()} hist pts ${orientTag}`
+      );
+    }
+
+    // ── [2] Back-project depth grid to 3-D ────────────────────────────────
     const vX    = new Float32Array(H * W);
     const vY    = new Float32Array(H * W);
     const vZ    = new Float32Array(H * W);
@@ -349,7 +581,7 @@ function Home() {
 
     for (let r = 0; r < H; r++) {
       for (let c = 0; c < W; c++) {
-        const d   = depth_map[r * W + c];
+        const d   = effectiveDepth[r * W + c];
         const idx = r * W + c;
         if (d > 0) {
           vX[idx] = -((c - cx) * d / fx);
@@ -360,7 +592,8 @@ function Home() {
       }
     }
 
-    // Per-pixel RGB: green = walkable (road/sidewalk/terrain), red = non-walkable
+    // ── [3] Walkability per-pixel colors (green = walkable, red = other) ──
+    // Classes 0=road, 1=sidewalk, 9=terrain are considered walkable.
     const WALKABLE = new Set([0, 1, 9]);
     const pixRGB   = new Float32Array(H * W * 3);
     if (hasSeg) {
@@ -375,15 +608,22 @@ function Home() {
       pixRGB.fill(0.65);
     }
 
+    // ── [4] Build triangle soup: positions + walkability colors + UVs ─────
+    // UV derivation:  depth grid pixel (row, col) corresponds uniformly to
+    // the captured camera frame.  UV coords = (col/(W-1), row/(H-1)) with
+    // tex.flipY=false so v=0 is the top of the image (row 0).
     const positions: number[] = [];
     const colors: number[]    = [];
+    const uvs: number[]       = [];
+    const W1 = Math.max(1, W - 1);
+    const H1 = Math.max(1, H - 1);
 
     for (let r = 0; r < H - 1; r++) {
       for (let c = 0; c < W - 1; c++) {
         const i00 = r * W + c;
-        const i01 = r * W + c + 1;
+        const i01 = r * W + (c + 1);
         const i10 = (r + 1) * W + c;
-        const i11 = (r + 1) * W + c + 1;
+        const i11 = (r + 1) * W + (c + 1);
 
         if (!valid[i00] || !valid[i01] || !valid[i10] || !valid[i11]) continue;
 
@@ -391,58 +631,90 @@ function Home() {
         const dMin = Math.min(vZ[i00], vZ[i01], vZ[i10], vZ[i11]);
         if (dMax - dMin > threshold) continue;
 
+        // Triangle A: top-left, bottom-left, top-right
         positions.push(
-          vX[i00], vY[i00], vZ[i00], vX[i10], vY[i10], vZ[i10], vX[i01], vY[i01], vZ[i01],
-          vX[i01], vY[i01], vZ[i01], vX[i10], vY[i10], vZ[i10], vX[i11], vY[i11], vZ[i11],
+          vX[i00], vY[i00], vZ[i00],
+          vX[i10], vY[i10], vZ[i10],
+          vX[i01], vY[i01], vZ[i01],
         );
         colors.push(
-          pixRGB[i00*3], pixRGB[i00*3+1], pixRGB[i00*3+2],
-          pixRGB[i10*3], pixRGB[i10*3+1], pixRGB[i10*3+2],
-          pixRGB[i01*3], pixRGB[i01*3+1], pixRGB[i01*3+2],
-          pixRGB[i01*3], pixRGB[i01*3+1], pixRGB[i01*3+2],
-          pixRGB[i10*3], pixRGB[i10*3+1], pixRGB[i10*3+2],
-          pixRGB[i11*3], pixRGB[i11*3+1], pixRGB[i11*3+2],
+          pixRGB[i00 * 3], pixRGB[i00 * 3 + 1], pixRGB[i00 * 3 + 2],
+          pixRGB[i10 * 3], pixRGB[i10 * 3 + 1], pixRGB[i10 * 3 + 2],
+          pixRGB[i01 * 3], pixRGB[i01 * 3 + 1], pixRGB[i01 * 3 + 2],
+        );
+        uvs.push(
+           c      / W1,  r      / H1,
+           c      / W1, (r + 1) / H1,
+          (c + 1) / W1,  r      / H1,
+        );
+
+        // Triangle B: top-right, bottom-left, bottom-right
+        positions.push(
+          vX[i01], vY[i01], vZ[i01],
+          vX[i10], vY[i10], vZ[i10],
+          vX[i11], vY[i11], vZ[i11],
+        );
+        colors.push(
+          pixRGB[i01 * 3], pixRGB[i01 * 3 + 1], pixRGB[i01 * 3 + 2],
+          pixRGB[i10 * 3], pixRGB[i10 * 3 + 1], pixRGB[i10 * 3 + 2],
+          pixRGB[i11 * 3], pixRGB[i11 * 3 + 1], pixRGB[i11 * 3 + 2],
+        );
+        uvs.push(
+          (c + 1) / W1,  r      / H1,
+           c      / W1, (r + 1) / H1,
+          (c + 1) / W1, (r + 1) / H1,
         );
       }
     }
 
+    // ── [5] Commit geometry ───────────────────────────────────────────────
     surface.geometry.dispose();
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(positions), 3));
-    geo.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(colors), 3));
+    geo.setAttribute('color',    new THREE.BufferAttribute(new Float32Array(colors),    3));
+    geo.setAttribute('uv',       new THREE.BufferAttribute(new Float32Array(uvs),       2));
     geo.computeVertexNormals();
     surface.geometry = geo;
 
-    autoFitMesh(geo);
+    // ── [6] Apply correct material ────────────────────────────────────────
+    if (meshTextureRef.current) {
+      texMat.map = meshTextureRef.current;
+      texMat.needsUpdate = true;
+    }
+    if (meshViewModeRef.current === 'texture' && meshTextureRef.current) {
+      surface.material = texMat;
+    } else {
+      surface.material = walkMat;
+    }
 
+    // ── [7] Update frame accumulation buffer ──────────────────────────────
+    // Store ORIGINAL depth_map (not accumulated) so we don't compound old averages.
+    const snapshot: FrameSnapshot = {
+      depth_map:   depth_map,
+      seg_map:     seg_map ?? [],
+      grid_h: H,   grid_w: W,
+      grid_fx: fx, grid_fy: fy, grid_cx: cx, grid_cy: cy,
+      timestamp:   Date.now(),
+      orientation: orientationRef.current ? { ...orientationRef.current } : null,
+    };
+    const maxN = accumFramesRef.current;
+    frameBufferRef.current = [...frameBufferRef.current, snapshot].slice(-maxN);
+
+    autoFitMesh(geo);
+    setHasMesh(true);
+
+    const meshMs   = performance.now() - t0Mesh;
     const triCount = positions.length / 9;
-    const ds = result.depth_stats;
+    const ds       = result.depth_stats;
     appendLog("MESH",
-      `${triCount.toLocaleString()} tris  ·  depth [${ds.min_m.toFixed(2)}–${ds.max_m.toFixed(2)} m]  ·  seg ${hasSeg ? '✓' : '—'}`
+      `${triCount.toLocaleString()} tris · ${meshMs.toFixed(0)} ms · depth [${ds.min_m.toFixed(2)}–${ds.max_m.toFixed(2)} m] · seg ${hasSeg ? '✓' : '—'}`
     );
   }, [appendLog, autoFitMesh]);
-
-  // ── Capture frame from camera ─────────────────────────────────────────────
-  const captureFrame = (): string | null => {
-    const video  = videoRef.current;
-    const canvas = captureCanvasRef.current;
-    if (!video || !canvas) return null;
-    const ctx = canvas.getContext('2d');
-    if (!ctx || video.videoWidth === 0) return null;
-    canvas.width  = video.videoWidth;
-    canvas.height = video.videoHeight;
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    appendLog("CAPTURE", `${canvas.width}×${canvas.height} px`);
-    return canvas.toDataURL('image/jpeg', 0.85).replace(/^data:image\/jpeg;base64,/, "");
-  };
 
   // ── POST /depth/scan ──────────────────────────────────────────────────────
   const startScan = async (): Promise<string | null> => {
     const b64 = captureFrame();
-    if (!b64) {
-      appendLog("ERROR", "camera not ready — no frame captured");
-      return null;
-    }
+    if (!b64) { appendLog("ERROR", "camera not ready — no frame captured"); return null; }
     const video = videoRef.current!;
     const cx = (captureCanvasRef.current?.width  ?? video.videoWidth)  / 2;
     const cy = (captureCanvasRef.current?.height ?? video.videoHeight) / 2;
@@ -451,13 +723,8 @@ function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          image:      b64,
-          fx:         focalLengthRef.current,
-          fy:         focalLengthRef.current,
-          cx, cy,
-          max_depth:  maxDepthRef.current,
-          voxel_size: 0.25,   // kept for API compatibility — not used in UI
-          min_points: 2,
+          image: b64, fx: focalLengthRef.current, fy: focalLengthRef.current, cx, cy,
+          max_depth: maxDepthRef.current, voxel_size: 0.25, min_points: 2,
         }),
       });
       if (!res.ok) throw new Error(`POST /depth/scan → HTTP ${res.status}: ${await res.text()}`);
@@ -474,11 +741,9 @@ function Home() {
   // ── Poll GET /depth/status/{job_id} until done ────────────────────────────
   const pollUntilDone = async (jobId: string): Promise<void> => {
     let lastStageCount = 0;
-
     while (isRunningRef.current) {
       await new Promise(r => setTimeout(r, 2000));
       if (!isRunningRef.current) break;
-
       let status: JobStatus;
       try {
         const res = await fetch(`/depth/status/${jobId}`);
@@ -488,7 +753,6 @@ function Home() {
         appendLog("ERROR", `poll: ${(err as Error).message}`);
         continue;
       }
-
       const stages = status.stages ?? [];
       for (let i = lastStageCount; i < stages.length; i++) {
         const s = stages[i];
@@ -502,7 +766,6 @@ function Home() {
         }
       }
       lastStageCount = stages.length;
-
       if (status.status === 'done' && status.result) {
         renderMesh(status.result);
         appendLog("DONE", `${status.elapsed_s}s  ·  ${status.result.total_points.toLocaleString()} pts`);
@@ -543,21 +806,28 @@ function Home() {
     const next = !isRunningRef.current;
     isRunningRef.current = next;
     setIsRunning(next);
-    if (next) loop();
+    if (next) {
+      requestOrientPermission(); // iOS: must be called from a user-gesture handler
+      loop();
+    }
   };
 
   // ── Stage colour coding ───────────────────────────────────────────────────
   const getStageColor = (stage: string) => {
-    if (stage === 'ERROR')   return 'text-destructive';
-    if (stage === 'DEPTH')   return 'text-yellow-400';
-    if (stage === 'SEGMENT') return 'text-emerald-400';
+    if (stage === 'ERROR')    return 'text-destructive';
+    if (stage === 'DEPTH')    return 'text-yellow-400';
+    if (stage === 'DENOISE')  return 'text-teal-400';       // NEW
+    if (stage === 'SEGMENT')  return 'text-emerald-400';
     if (stage === 'BACKPROJ') return 'text-primary/70';
     if (stage === 'VOXELIZE') return 'text-primary/70';
-    if (stage === 'SERIALIZE') return 'text-primary/50';
-    if (stage === 'MESH')    return 'text-cyan-400';
-    if (stage === 'DONE')    return 'text-green-400';
-    if (stage === 'CAPTURE') return 'text-primary/50';
-    if (stage === 'START')   return 'text-primary/50';
+    if (stage === 'SERIALIZE')return 'text-primary/50';
+    if (stage === 'MESH')     return 'text-cyan-400';
+    if (stage === 'ACCUM')    return 'text-violet-400';     // NEW
+    if (stage === 'ORIENT')   return 'text-sky-400';        // NEW
+    if (stage === 'VIEW')     return 'text-orange-400';     // NEW
+    if (stage === 'DONE')     return 'text-green-400';
+    if (stage === 'CAPTURE')  return 'text-primary/50';
+    if (stage === 'START')    return 'text-primary/50';
     return 'text-primary/80';
   };
 
@@ -571,7 +841,7 @@ function Home() {
       <div className="w-[38%] h-full flex flex-col border-r border-border bg-card/50 shadow-[4px_0_24px_rgba(0,0,0,0.5)] z-10">
 
         {/* Header */}
-        <div className="px-5 pt-5 pb-4 border-b border-border bg-black/40 backdrop-blur-sm">
+        <div className="px-5 pt-5 pb-4 border-b border-border bg-black/40 backdrop-blur-sm shrink-0">
           <h1 className="text-2xl font-bold uppercase tracking-widest text-primary flex items-center gap-3 drop-shadow-[0_0_8px_rgba(0,255,128,0.5)]">
             <span className="w-2.5 h-2.5 bg-primary rounded-full animate-pulse shadow-[0_0_12px_rgba(0,255,128,0.8)]" />
             Depth Scan
@@ -581,8 +851,8 @@ function Home() {
           </p>
         </div>
 
-        {/* Sliders — grouped by function */}
-        <div className="px-5 py-4 border-b border-border bg-black/30 space-y-4">
+        {/* Sliders — scrollable so everything fits */}
+        <div className="px-5 py-4 border-b border-border bg-black/30 space-y-3 overflow-y-auto shrink-0">
           <SectionLabel title="Capture" />
           <div className="grid grid-cols-2 gap-3">
             <ControlSlider label="Max Depth"    value={maxDepth}    min={1.0}  max={15.0} step={0.5}  unit="m"  onChange={handleMaxDepthChange} />
@@ -591,10 +861,27 @@ function Home() {
 
           <SectionLabel title="Mesh" />
           <ControlSlider label="Edge Gap Threshold" value={depthJumpThreshold} min={0.05} max={2.0} step={0.05} unit="m" onChange={handleDepthJumpThresholdChange} />
+
+          <SectionLabel title="Accumulation" />
+          <div className="space-y-2">
+            <TogglePill label="Multi-Frame Merge" value={accumEnabled} onChange={handleAccumEnabledChange} />
+            {accumEnabled && (
+              <>
+                <ControlSlider
+                  label="History (N frames)" value={accumFrames} min={2} max={8} step={1} unit=""
+                  onChange={handleAccumFramesChange}
+                />
+                <div className="font-mono text-[10px] text-muted-foreground/40 text-right pr-1">
+                  buffer: {accumFrames} frames max
+                  {orientAvailable ? '  ·  🧭 orient:active' : '  ·  orient:—'}
+                </div>
+              </>
+            )}
+          </div>
         </div>
 
         {/* Diagnostics + camera feed */}
-        <div className="px-5 py-4 border-b border-border flex justify-between items-start gap-4 bg-gradient-to-b from-black/20 to-transparent">
+        <div className="px-5 py-4 border-b border-border flex justify-between items-start gap-4 bg-gradient-to-b from-black/20 to-transparent shrink-0">
           <div className="flex-1 min-w-0">
             <SectionLabel title="Diagnostics" />
             <div className="mt-2 space-y-2">
@@ -626,7 +913,7 @@ function Home() {
         </div>
 
         {/* Scan button */}
-        <div className="px-5 py-4 border-b border-border bg-black/20 space-y-2">
+        <div className="px-5 py-4 border-b border-border bg-black/20 space-y-2 shrink-0">
           <button
             onClick={toggleRunning}
             className={`w-full py-3.5 font-bold uppercase tracking-[0.2em] text-sm rounded-lg transition-all duration-300 border-2 ${
@@ -637,13 +924,8 @@ function Home() {
                 : 'bg-primary/10 text-primary border-primary shadow-[0_0_20px_rgba(0,255,128,0.2)] hover:bg-primary/20 hover:shadow-[0_0_30px_rgba(0,255,128,0.5)]'
             }`}
           >
-            {isBusy
-              ? `⟳  Processing…  ${currentStage ?? ''}`
-              : isRunning
-              ? 'Halt Scan'
-              : 'Initialize Scan'}
+            {isBusy ? `⟳  Processing…  ${currentStage ?? ''}` : isRunning ? 'Halt Scan' : 'Initialize Scan'}
           </button>
-
           <div className={`flex justify-between items-center font-mono text-[11px] transition-opacity duration-300 ${isRunning ? 'opacity-100' : 'opacity-0'}`}>
             <span className="text-primary/50">{currentJobId ? `JOB: ${currentJobId}` : 'QUEUING…'}</span>
             <span className={`tabular-nums ${elapsedSeconds > 60 ? 'text-yellow-400' : 'text-primary/70'}`}>
@@ -654,13 +936,10 @@ function Home() {
 
         {/* Terminal log */}
         <div className="flex-1 flex flex-col overflow-hidden bg-[#020204]">
-          <div className="px-5 pt-4 pb-2">
+          <div className="px-5 pt-4 pb-2 shrink-0">
             <SectionLabel title="Terminal Output" />
           </div>
-          <div
-            ref={logContainerRef}
-            className="flex-1 overflow-y-auto px-4 pb-4 font-mono text-[11.5px] space-y-0.5"
-          >
+          <div ref={logContainerRef} className="flex-1 overflow-y-auto px-4 pb-4 font-mono text-[11.5px] space-y-0.5">
             {logs.length === 0 && (
               <div className="text-muted-foreground/40 italic px-1 pt-1">Awaiting telemetry…</div>
             )}
@@ -682,14 +961,14 @@ function Home() {
       {/* ── RIGHT PANEL — Three.js canvas ── */}
       <div className="flex-1 h-full relative bg-[#030305]">
 
-        {/* WebGL error */}
+        {/* WebGL error overlay */}
         {webGLError && (
           <div className="absolute inset-0 flex items-center justify-center z-20 bg-black/90 p-8">
             <div className="font-mono border border-yellow-400/30 bg-yellow-400/5 rounded-lg p-6 max-w-md text-center space-y-3">
               <div className="text-yellow-400 font-bold text-sm tracking-widest uppercase">WebGL Context Unavailable</div>
               <div className="text-gray-400 text-xs leading-relaxed">{webGLError}</div>
               <div className="text-primary/60 text-xs pt-2 border-t border-primary/10">
-                The backend pipeline will still work — only the 3D render requires a GPU-capable browser context.
+                The backend pipeline will still work — only 3D render requires a GPU-capable browser context.
               </div>
             </div>
           </div>
@@ -700,7 +979,7 @@ function Home() {
           <canvas ref={canvasRef} className="block w-full h-full outline-none" />
         </div>
 
-        {/* Processing overlay — shown while a job is in flight */}
+        {/* Processing overlay */}
         {isBusy && (
           <div className="absolute inset-0 z-10 pointer-events-none flex items-center justify-center">
             <div className="bg-black/70 backdrop-blur-sm border border-primary/20 rounded-xl px-8 py-5 flex flex-col items-center gap-3 shadow-[0_0_40px_rgba(0,0,0,0.8)]">
@@ -729,27 +1008,58 @@ function Home() {
           </div>
         </div>
 
-        {/* Walkability legend — bottom-right corner */}
-        <div className="absolute bottom-5 right-5 z-10 pointer-events-none">
-          <div className="bg-black/70 backdrop-blur-sm border border-primary/15 rounded-xl px-5 py-3.5">
-            <div className="text-[9px] text-primary/50 uppercase tracking-[0.18em] font-bold font-mono mb-2.5 text-center">
-              Walkability
-            </div>
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-2.5">
-                <div className="w-3.5 h-3.5 rounded-sm bg-[#21b845] shadow-[0_0_8px_rgba(33,184,69,0.7)] shrink-0" />
-                <span className="font-mono text-[11px] text-[#21b845] font-semibold">Walkable</span>
+        {/* View mode toggle — top-left, visible after first mesh rendered */}
+        {hasMesh && (
+          <div className="absolute top-4 left-4 z-10">
+            <button
+              onClick={handleMeshViewToggle}
+              className={`font-mono text-[10px] uppercase tracking-widest px-3 py-1.5 rounded border transition-all duration-200 backdrop-blur-sm ${
+                meshViewMode === 'texture'
+                  ? 'bg-amber-400/10 border-amber-400/40 text-amber-300 shadow-[0_0_12px_rgba(251,191,36,0.2)] hover:bg-amber-400/20'
+                  : 'bg-primary/10 border-primary/30 text-primary/80 hover:bg-primary/20'
+              }`}
+            >
+              {meshViewMode === 'texture' ? '📷  Texture' : '🗺  Walkability'}
+            </button>
+          </div>
+        )}
+
+        {/* Walkability legend — bottom-right (walkability mode) */}
+        {meshViewMode === 'walkability' && (
+          <div className="absolute bottom-5 right-5 z-10 pointer-events-none">
+            <div className="bg-black/70 backdrop-blur-sm border border-primary/15 rounded-xl px-5 py-3.5">
+              <div className="text-[9px] text-primary/50 uppercase tracking-[0.18em] font-bold font-mono mb-2.5 text-center">
+                Walkability
               </div>
-              <div className="flex items-center gap-2.5">
-                <div className="w-3.5 h-3.5 rounded-sm bg-[#d12b2b] shadow-[0_0_8px_rgba(209,43,43,0.7)] shrink-0" />
-                <span className="font-mono text-[11px] text-[#d12b2b] font-semibold">Non-walkable</span>
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-3.5 h-3.5 rounded-sm bg-[#21b845] shadow-[0_0_8px_rgba(33,184,69,0.7)] shrink-0" />
+                  <span className="font-mono text-[11px] text-[#21b845] font-semibold">Walkable</span>
+                </div>
+                <div className="flex items-center gap-2.5">
+                  <div className="w-3.5 h-3.5 rounded-sm bg-[#d12b2b] shadow-[0_0_8px_rgba(209,43,43,0.7)] shrink-0" />
+                  <span className="font-mono text-[11px] text-[#d12b2b] font-semibold">Non-walkable</span>
+                </div>
               </div>
-            </div>
-            <div className="font-mono text-[8.5px] text-primary/25 mt-2.5 pt-2 border-t border-primary/10 text-center">
-              road · sidewalk · terrain
+              <div className="font-mono text-[8.5px] text-primary/25 mt-2.5 pt-2 border-t border-primary/10 text-center">
+                road · sidewalk · terrain
+              </div>
             </div>
           </div>
-        </div>
+        )}
+
+        {/* Texture legend — bottom-right (texture mode) */}
+        {meshViewMode === 'texture' && hasMesh && (
+          <div className="absolute bottom-5 right-5 z-10 pointer-events-none">
+            <div className="bg-black/70 backdrop-blur-sm border border-amber-400/20 rounded-xl px-5 py-3.5">
+              <div className="text-[9px] text-amber-400/60 uppercase tracking-[0.18em] font-bold font-mono mb-1.5 text-center">
+                Camera Texture
+              </div>
+              <div className="font-mono text-[10px] text-amber-300/70 text-center">UV-mapped photo</div>
+              <div className="font-mono text-[8px] text-amber-400/30 mt-1.5 text-center">ambient + directional lit</div>
+            </div>
+          </div>
+        )}
 
         {/* Dot-grid overlay */}
         <div className="absolute inset-0 pointer-events-none bg-[url('data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI0MCIgaGVpZ2h0PSI0MCI+PGNpcmNsZSBjeD0iMSIgY3k9IjEiIHI9IjEiIGZpbGw9InJnYmEoMCwyNTUsMTI4LDAuMDUpIi8+PC9zdmc+')] opacity-50 mix-blend-screen" />

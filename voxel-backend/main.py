@@ -91,10 +91,14 @@ def _add_job(job_id: str) -> dict:
     return job
 
 
-def _record(job: dict, stage: str, state: str, msg: str = "", error: str = "") -> None:
+def _record(job: dict, stage: str, state: str, msg: str = "", error: str = "",
+            fatal: bool = True) -> None:
     """Append a stage-event entry and update job.current_stage.
 
-    state is one of: "start" | "done" | "error"
+    state is one of: "start" | "done" | "warn" | "error"
+    fatal=False keeps job["status"] unchanged so the pipeline continues even
+    after recording an error event.  Use this for non-critical stages such as
+    DENOISE and SEGMENT where the pipeline has a fallback path.
     """
     job["stages"].append({
         "stage": stage,
@@ -104,7 +108,7 @@ def _record(job: dict, stage: str, state: str, msg: str = "", error: str = "") -
         "error": error,
     })
     job["current_stage"] = stage
-    if state == "error":
+    if state == "error" and fatal:
         job["status"] = "error"
 
 
@@ -215,6 +219,92 @@ class ScanRequest(BaseModel):
     min_points: int = Field(2, ge=1, description="Min points to mark voxel occupied")
 
 
+# ─── Depth-map preprocessing helpers ─────────────────────────────────────────
+
+def _bilateral_filter_depth(
+    depth: np.ndarray,
+    sigma_s: float = 2.0,
+    sigma_r: float = 0.25,
+    radius:  int   = 2,
+) -> np.ndarray:
+    """Bilateral filter for depth maps (pure NumPy, no extra dependencies).
+
+    Smooths flat surfaces while preserving real depth discontinuities at
+    object/surface boundaries.  Operates on the mesh-resolution grid
+    (≤160×120 pixels), so a radius-2 (5×5) kernel adds only ~5–15 ms.
+
+    sigma_s — spatial Gaussian σ (pixels)
+    sigma_r — range Gaussian σ (metres); smaller = sharper edge preservation
+    """
+    H, W  = depth.shape
+    valid = depth > 0
+    if not valid.any():
+        return depth
+
+    # Precompute spatial Gaussian weights for the kernel
+    ys, xs  = np.mgrid[-radius: radius + 1, -radius: radius + 1]
+    spatial = np.exp(-(xs ** 2 + ys ** 2) / (2.0 * sigma_s ** 2)).astype(np.float32)
+
+    depth_pad = np.pad(depth, radius, mode="reflect")
+    valid_pad = np.pad(valid.astype(np.float32), radius, mode="constant")
+
+    accum = np.zeros_like(depth, dtype=np.float32)
+    wsum  = np.zeros_like(depth, dtype=np.float32)
+
+    ks = 2 * radius + 1
+    for dy in range(ks):
+        for dx in range(ks):
+            nb      = depth_pad[dy: dy + H, dx: dx + W]
+            nb_mask = valid_pad[dy: dy + H, dx: dx + W]
+            # Range weight: exponential decay by |depth - neighbor_depth|
+            range_w = np.exp(-((depth - nb) ** 2) / (2.0 * sigma_r ** 2))
+            w = spatial[dy, dx] * range_w * nb_mask
+            accum += w * nb
+            wsum  += w
+
+    result         = depth.copy()
+    fill_mask      = valid & (wsum > 1e-9)
+    result[fill_mask] = accum[fill_mask] / wsum[fill_mask]
+    return result
+
+
+def _fill_depth_holes(depth: np.ndarray, iterations: int = 4) -> tuple:
+    """Iterative 4-neighbour dilation to fill small holes in the depth map.
+
+    Each iteration expands valid pixels one step into adjacent invalid pixels
+    (nearest-neighbour average of valid cardinal neighbours).  Running
+    *iterations* rounds fills holes up to *iterations* pixels wide.
+    Remaining zeros after all iterations are "large holes" — they stay zero
+    so the mesh builder treats them as genuine surface discontinuities.
+
+    Returns (filled_depth, small_px_filled, large_px_remaining)
+    """
+    result    = depth.copy()
+    invalid_0 = int((result == 0).sum())
+    if invalid_0 == 0:
+        return result, 0, 0
+
+    for _ in range(iterations):
+        if not (result == 0).any():
+            break
+        pad       = np.pad(result, 1, mode="constant", constant_values=0.0)
+        pad_valid = pad > 0
+
+        n_u = pad[:-2, 1:-1];  m_u = pad_valid[:-2, 1:-1].astype(np.float32)
+        n_d = pad[2:,  1:-1];  m_d = pad_valid[2:,  1:-1].astype(np.float32)
+        n_l = pad[1:-1, :-2];  m_l = pad_valid[1:-1, :-2].astype(np.float32)
+        n_r = pad[1:-1, 2:];   m_r = pad_valid[1:-1, 2:].astype(np.float32)
+
+        total_w = m_u + m_d + m_l + m_r
+        total_v = n_u * m_u + n_d * m_d + n_l * m_l + n_r * m_r
+
+        can_fill          = (result == 0) & (total_w > 0)
+        result[can_fill]  = (total_v / np.maximum(total_w, 1e-9))[can_fill]
+
+    invalid_1 = int((result == 0).sum())
+    return result, invalid_0 - invalid_1, invalid_1
+
+
 # ─── Pipeline (runs in a background thread) ───────────────────────────────────
 def _run_pipeline(job_id: str, req: ScanRequest) -> None:
     """Execute all 5 pipeline stages, writing progress into jobs[job_id]."""
@@ -277,7 +367,37 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
             msg=f"{depth_s*1000:.0f} ms  |  range [{d_min:.2f}–{d_max:.2f} m]  mean {d_mean:.2f} m")
     logger.info(f"[{job_id}] DEPTH {depth_s*1000:.0f} ms  [{d_min:.2f}–{d_max:.2f} m]")
 
-    # ── Stage 2.5: Semantic segmentation (walkability overlay) ───────────────
+    # ── Stage 2.5: Denoise — bilateral filter + hole fill ────────────────────
+    # Operate on the mesh grid (~160×120) for speed; the denoised result is
+    # stored in `depth_dn_small` and used by SERIALIZE instead of re-downsampling.
+    # BACKPROJ continues from the raw full-res `depth_array` (unchanged).
+    _record(job, "DENOISE", "start")
+    t_dn = time.perf_counter()
+    MESH_TARGET_W, MESH_TARGET_H = 160, 120
+    dn_scale = min(1.0, MESH_TARGET_W / W, MESH_TARGET_H / H)
+    dn_w = max(1, round(W * dn_scale))
+    dn_h = max(1, round(H * dn_scale))
+    try:
+        # Downsample once here so SERIALIZE can reuse depth_dn_small directly.
+        depth_dn_raw = np.array(
+            Image.fromarray(depth_array).resize((dn_w, dn_h), Image.BILINEAR),
+            dtype=np.float32,
+        )
+        depth_dn_filt = _bilateral_filter_depth(depth_dn_raw)
+        depth_dn_small, filled, remaining = _fill_depth_holes(depth_dn_filt)
+        dn_s = time.perf_counter() - t_dn
+        _record(job, "DENOISE", "done",
+                msg=(f"{dn_s*1000:.0f} ms  |  bilateral σ_s=2 σ_r=0.25  "
+                     f"grid {dn_w}×{dn_h}  hole-fill: +{filled} px  {remaining} remaining"))
+        logger.info(
+            f"[{job_id}] DENOISE {dn_s*1000:.0f} ms  grid={dn_w}×{dn_h}  "
+            f"filled={filled} remaining={remaining}"
+        )
+    except Exception as exc:
+        _record(job, "DENOISE", "error", error=f"{exc}\n{traceback.format_exc()}", fatal=False)
+        depth_dn_small = None   # SERIALIZE falls back to raw downsample
+
+    # ── Stage 2.7: Semantic segmentation (walkability overlay) ───────────────
     seg_full = np.zeros((H, W), dtype=np.uint8)
     if seg_processor is not None and seg_model is not None:
         _record(job, "SEGMENT", "start")
@@ -300,7 +420,7 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
                     msg=f"{seg_s*1000:.0f} ms  |  {num_classes} classes  {W}×{H}")
             logger.info(f"[{job_id}] SEGMENT {seg_s*1000:.0f} ms")
         except Exception as exc:
-            _record(job, "SEGMENT", "error", error=f"{exc}\n{traceback.format_exc()}")
+            _record(job, "SEGMENT", "error", error=f"{exc}\n{traceback.format_exc()}", fatal=False)
             seg_full = np.zeros((H, W), dtype=np.uint8)
 
     # ── Stage 3: Back-project to 3-D point cloud ──────────────────────────────
@@ -387,20 +507,25 @@ def _run_pipeline(job_id: str, req: ScanRequest) -> None:
         ]
 
         # ── Subsample depth map for mesh reconstruction ───────────────────────
-        # Downsample to at most 160×120 so JSON payload stays reasonable.
-        # Depth values (metres) don't change with resolution; only pixel coords scale.
-        MESH_TARGET_W, MESH_TARGET_H = 160, 120
-        scale = min(1.0, MESH_TARGET_W / W, MESH_TARGET_H / H)
-        mesh_w = max(1, round(W * scale))
-        mesh_h = max(1, round(H * scale))
-        if scale < 1.0:
-            depth_small = np.array(
-                Image.fromarray(depth_array).resize((mesh_w, mesh_h), Image.BILINEAR),
-                dtype=np.float32,
-            )
+        # Prefer the pre-filtered depth from DENOISE (bilateral + hole-fill).
+        # Fall back to raw bilinear downsample if DENOISE errored.
+        if depth_dn_small is not None:
+            depth_small = depth_dn_small
+            mesh_w, mesh_h = dn_w, dn_h
+            scale = dn_scale
         else:
-            depth_small = depth_array
-            mesh_w, mesh_h = W, H
+            MESH_TARGET_W, MESH_TARGET_H = 160, 120
+            scale = min(1.0, MESH_TARGET_W / W, MESH_TARGET_H / H)
+            mesh_w = max(1, round(W * scale))
+            mesh_h = max(1, round(H * scale))
+            if scale < 1.0:
+                depth_small = np.array(
+                    Image.fromarray(depth_array).resize((mesh_w, mesh_h), Image.BILINEAR),
+                    dtype=np.float32,
+                )
+            else:
+                depth_small = depth_array
+                mesh_w, mesh_h = W, H
 
         # Clamp invalid/out-of-range values to 0 so frontend can skip them
         depth_small = np.where(
